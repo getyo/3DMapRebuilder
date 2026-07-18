@@ -19,7 +19,7 @@ import os, math
 
 # ============ 1. 输入配置 ============
 SANHE_VEC = "TestInput\\SanHe\\vec_raw.png"
-SANHE_SATE = "TestInput\SanHe\satellite.png"
+SANHE_SATE = "TestInput\SanHe\satellite.tif"
 
 # ============ 2. RGBA 颜色常量 ============
 class RGBA(NamedTuple):
@@ -28,6 +28,9 @@ class RGBA(NamedTuple):
     G: int
     B: int
     A: int = 255
+
+# ============ 3. 输出配置 ============
+SANHE_LABEL_DIR = "TestInput\SanHe"
 
 # 精确标签颜色（基于用户提供的纯色样本）
 COLOR_WATER    = RGBA(171, 198, 239)  # 水体
@@ -40,13 +43,15 @@ COLOR_BRANCH_ROAD = RGBA(254, 205, 120)  # 国道  G=80
 COLOR_SMALL_ROAD  = RGBA(254, 235, 130)  # 省道  G=120
 COLOR_PATH        = RGBA(255, 255, 255)  # 小路  G=160
 
+# RGB容差
+RGB_DIFF = 2
 
 def _match_rgba(r, g, b, color: RGBA, opaque):
     """像素 (R,G,B) 是否匹配给定颜色(±1 容差)，且不透明"""
     return opaque & \
-        (r >= color.R - 1) & (r <= color.R + 1) & \
-        (g >= color.G - 1) & (g <= color.G + 1) & \
-        (b >= color.B - 1) & (b <= color.B + 1)
+        (r >= color.R - RGB_DIFF) & (r <= color.R + RGB_DIFF) & \
+        (g >= color.G - RGB_DIFF) & (g <= color.G + RGB_DIFF) & \
+        (b >= color.B - RGB_DIFF) & (b <= color.B + RGB_DIFF)
 
 
 # ============ 3. 分类器 ============
@@ -253,12 +258,7 @@ class VecClassifier:
 
 
 # ============ 5. 入口 ============
-def main():
-    classifier = VecClassifier()
-    classifier.set_input(SANHE_VEC, SANHE_SATE)
-    classifier.set_output("TestInput\SanHe")
-    classifier.run()
-
-
-if __name__ == "__main__":
-    main()
+classifier = VecClassifier()
+classifier.set_input(SANHE_VEC, SANHE_SATE)
+classifier.set_output(SANHE_LABEL_DIR)
+classifier.run()
