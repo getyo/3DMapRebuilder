@@ -2,15 +2,13 @@
 """
 gen_adaptive_terrain.py -- 自适应分辨率 UE 地形生成器
 
-策略：
-  - 用 LabelPostprocessor 生成/确认 labels_10x_no_boundary.tif 和 boundary_lines_10x.png
-  - 从 boundary_lines_10x.png 提取 1 像素宽的 10x 边界线
-  - 粗网格顶点 + 密集边界点 → scipy.spatial.Delaunay 三角化
-  - 三角形大小自然自适应：内部大，边界小
-  - 每个三角形按重心 class_id 分到 4 个材质槽之一
-  - 不做高斯平滑
-  - 水体保留凹包/盆地
-  - 坐标系：UE 左手系 Z-up（X=east, Y=-north, Z=height）
+本文件是完整管线的唯一入口（main），负责：
+  1. 语义分类（classify_vecw.py）
+  2. 标签后处理（label_postprocess.py）
+  3. 简化 3DGS 语义地图（gen_semantic.py）
+  4. 自适应分辨率地形 OBJ 生成（本文件 AdaptiveTerrainBuilder）
+
+其他模块仅通过 test() 方法自检输入并运行，不持有 main 入口。
 """
 
 import os
@@ -23,6 +21,13 @@ import rasterio
 import cv2
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import Delaunay
+
+# 添加脚本目录到导入路径，确保 standalone 运行能找到同级模块
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from classify_vecw import VecClassifier
+from gen_semantic import SemanticMapBuilder
+from label_postprocess import LabelPostprocessor
+
 
 # ═══════════════════════════════════════════════════════════════
 # 配置
@@ -39,10 +44,10 @@ UE_SCALE = 100.0                 # UE 单位缩放
 
 MAT_NAMES = ["M_Ground", "M_Road", "M_Building", "M_Water"]
 MAT_COLORS = [
-    (0.55, 0.45, 0.30),   # Ground
-    (0.28, 0.28, 0.30),   # Road
-    (0.82, 0.78, 0.70),   # Building
-    (0.10, 0.18, 0.28),   # Water
+    (0.55, 0.45, 0.30),   # 地面
+    (0.28, 0.28, 0.30),   # 道路
+    (0.82, 0.78, 0.70),   # 建筑
+    (0.10, 0.18, 0.28),   # 水体
 ]
 MAT_GROUND = 0
 MAT_ROAD = 1
@@ -51,6 +56,7 @@ MAT_WATER = 3
 
 
 def class_to_mat(class_id):
+    """class_id → 材质槽编号"""
     if class_id == 0:
         return MAT_WATER
     if class_id == 20:
@@ -65,6 +71,12 @@ def class_to_mat(class_id):
 # ═══════════════════════════════════════════════════════════════
 
 class AdaptiveTerrainBuilder:
+    """
+    从 10x 语义标签、边界线图和 DEM 生成 UE 可用的自适应分辨率地形网格。
+    内部采用 Delaunay + 密集边界点策略：粗网格顶点保证内部低面数，
+    边界点密集采样保证边界平滑。
+    """
+
     def __init__(
         self,
         label_10x_path: str,
@@ -95,23 +107,24 @@ class AdaptiveTerrainBuilder:
         self.water_depth_map = None
         self.boundary_mask = None
 
-        self.pts = None        # Delaunay 输入点 (r, c)
-        self.tri = None        # Delaunay 对象
-        self.verts = []        # (x, y, z, u, v)
-        self.faces = []        # (i0, i1, i2, mat_id)
+        self.pts = None
+        self.tri = None
+        self.verts = []
+        self.faces = []
 
     # ═══════════════════════════════════════════════════════════════
     # 加载与预处理
     # ═══════════════════════════════════════════════════════════════
 
     def load(self):
-        print(f"Loading 10x labels: {self.label_10x_path}")
+        """加载 10x 标签、DEM 与边界线，并构建水体盆地。"""
+        print(f"加载 10x 标签: {self.label_10x_path}")
         with rasterio.open(self.label_10x_path) as src:
             self.class_10x = src.read(1).astype(np.uint8)
         self.H10, self.W10 = self.class_10x.shape
-        print(f"  size: {self.W10}x{self.H10}")
+        print(f"  尺寸: {self.W10}x{self.H10}")
 
-        print(f"Loading DEM: {self.dem_path}")
+        print(f"加载 DEM: {self.dem_path}")
         with rasterio.open(self.dem_path) as src:
             dem_1x = src.read(1).astype(np.float32)
         self.dem_10x = cv2.resize(dem_1x, (self.W10, self.H10), interpolation=cv2.INTER_LINEAR)
@@ -121,34 +134,39 @@ class AdaptiveTerrainBuilder:
         self._build_boundary_mask()
 
     def _build_water_basin(self):
+        """基于距离变换生成水体凹包/盆地深度图。"""
         dist_px = distance_transform_edt(self.water_mask)
         dist_m = dist_px * (PX_M / SCALE)
         t = np.clip(dist_m / self.water_edge_width, 0.0, 1.0)
         self.water_depth_map = self.water_depth * (t * t * (3.0 - 2.0 * t))
         max_depth = self.water_depth_map[self.water_mask].max()
-        print(f"  Water basin depth: 0.0 ~ {max_depth:.2f} m")
+        print(f"  水体盆地深度: 0.0 ~ {max_depth:.2f} m")
 
     def _build_boundary_mask(self):
-        print(f"Loading boundary: {self.boundary_path}")
+        """从 boundary_lines_10x.png 提取 1 像素宽的边界线。"""
+        print(f"加载边界线: {self.boundary_path}")
         img = cv2.imread(self.boundary_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(f"边界线图不存在: {self.boundary_path}")
         if len(img.shape) == 3 and img.shape[2] == 4:
             mask = (img[:, :, 3] > 0).astype(np.uint8)
         else:
             mask = (img > 0).astype(np.uint8)
 
-        print(f"  raw boundary pixels: {mask.sum():,}")
-        # 细化为 1 像素宽的线（不依赖 cv2.ximgproc）
+        print(f"  原始边界像素: {mask.sum():,}")
+        # 不依赖 cv2.ximgproc，用轮廓重绘实现 1 像素细化
         contours, _ = cv2.findContours(mask * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         thinned = np.zeros_like(mask, dtype=np.uint8)
         cv2.drawContours(thinned, contours, -1, 255, thickness=1)
         self.boundary_mask = (thinned > 0)
-        print(f"  thinned boundary pixels: {self.boundary_mask.sum():,}")
+        print(f"  细化边界像素: {self.boundary_mask.sum():,}")
 
     # ═══════════════════════════════════════════════════════════════
     # 点集与 Delaunay
     # ═══════════════════════════════════════════════════════════════
 
     def build_delaunay(self):
+        """构建粗网格顶点 + 密集边界点，执行 Delaunay 三角化。"""
         CS = self.CS_10x
 
         # 粗网格顶点
@@ -162,41 +180,41 @@ class AdaptiveTerrainBuilder:
         gr, gc = np.meshgrid(grid_r, grid_c, indexing='ij')
         grid_pts = np.column_stack([gr.ravel(), gc.ravel()])
 
-        # 边界点（采样）
+        # 边界点采样
         br, bc = np.where(self.boundary_mask)
         if self.bd_step > 1:
             idx = np.arange(0, len(br), self.bd_step)
             br, bc = br[idx], bc[idx]
         bd_pts = np.column_stack([br, bc])
 
-        # 合并并去重
+        # 合并去重
         pts = np.unique(np.vstack([grid_pts, bd_pts]), axis=0)
         self.pts = pts.astype(np.float64)
-        print(f"  Total Delaunay points: {len(self.pts):,}  (grid {len(grid_pts):,}, boundary {len(bd_pts):,})")
+        print(f"  Delaunay 总点数: {len(self.pts):,} (粗网格 {len(grid_pts):,}, 边界 {len(bd_pts):,})")
 
-        print("Running Delaunay...")
+        print("执行 Delaunay 三角化...")
         t0 = time.time()
         self.tri = Delaunay(self.pts)
-        print(f"  Delaunay: {len(self.tri.simplices):,} triangles in {time.time()-t0:.1f}s")
+        print(f"  三角形数: {len(self.tri.simplices):,}, 耗时 {time.time()-t0:.1f}s")
 
     # ═══════════════════════════════════════════════════════════════
     # 网格生成
     # ═══════════════════════════════════════════════════════════════
 
     def build_mesh(self):
-        print("Building mesh...")
+        """根据 Delaunay 结果生成带材质的三维网格。"""
+        print("构建三维网格...")
         t0 = time.time()
-
         H, W = self.H10, self.W10
 
-        # 预计算所有点的 3D 顶点
+        # 预计算顶点
         for r, c in self.pts:
             r = int(round(r))
             c = int(round(c))
             r = np.clip(r, 0, H - 1)
             c = np.clip(c, 0, W - 1)
 
-            # UE 左手系：X=east, Y=-north, Z=height
+            # UE 左手系 Z-up：X=east, Y=-north, Z=height
             x = (c / SCALE) * PX_M * self.ue_scale
             y = -((r / SCALE) * PX_M * self.ue_scale)
             x -= (W / SCALE) * PX_M * self.ue_scale * 0.5
@@ -213,35 +231,34 @@ class AdaptiveTerrainBuilder:
 
             self.verts.append((x, y, z, u, v))
 
-        # 遍历三角形
+        # 遍历三角形，按重心 class 分配材质
         for tri in self.tri.simplices:
             i0, i1, i2 = tri
             p0 = self.pts[i0]
             p1 = self.pts[i1]
             p2 = self.pts[i2]
 
-            # 重心
             cr = (p0[0] + p1[0] + p2[0]) / 3.0
             cc = (p0[1] + p1[1] + p2[1]) / 3.0
             cr_i = int(round(np.clip(cr, 0, H - 1)))
             cc_i = int(round(np.clip(cc, 0, W - 1)))
-
             mat = class_to_mat(self.class_10x[cr_i, cc_i])
 
-            # 保证朝向一致：2D 叉积 > 0
+            # 统一朝向
             cross = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
             if cross < 0:
                 i0, i1 = i1, i0
 
             self.faces.append((i0, i1, i2, mat))
 
-        print(f"  Mesh: {len(self.verts):,} vertices, {len(self.faces):,} triangles in {time.time()-t0:.1f}s")
+        print(f"  顶点: {len(self.verts):,}, 三角形: {len(self.faces):,}, 耗时 {time.time()-t0:.1f}s")
 
     # ═══════════════════════════════════════════════════════════════
     # 法线与导出
     # ═══════════════════════════════════════════════════════════════
 
     def _compute_normals(self):
+        """按面法线加权平均计算顶点法线。"""
         verts = np.array([[v[0], v[1], v[2]] for v in self.verts], dtype=np.float64)
         norms = np.zeros((len(self.verts), 3), dtype=np.float64)
 
@@ -263,14 +280,15 @@ class AdaptiveTerrainBuilder:
         return norms
 
     def export(self):
+        """导出 OBJ + MTL。"""
         os.makedirs(self.out_dir, exist_ok=True)
         obj_path = os.path.join(self.out_dir, "terrain_adaptive.obj")
         mtl_path = os.path.join(self.out_dir, "terrain_adaptive.mtl")
 
-        print("Computing normals...")
+        print("计算法线...")
         norms = self._compute_normals()
 
-        print(f"Writing MTL: {mtl_path}")
+        print(f"写入 MTL: {mtl_path}")
         with open(mtl_path, "w", encoding="utf-8") as mf:
             for name, col in zip(MAT_NAMES, MAT_COLORS):
                 mf.write(f"newmtl {name}\n")
@@ -278,9 +296,9 @@ class AdaptiveTerrainBuilder:
                 mf.write("Ks 0.1 0.1 0.1\n")
                 mf.write("Ns 32.0\n\n")
 
-        print(f"Writing OBJ: {obj_path}")
+        print(f"写入 OBJ: {obj_path}")
         with open(obj_path, "w", encoding="utf-8") as of:
-            of.write("# Adaptive terrain from 10x labels (Delaunay + dense boundary)\n")
+            of.write("# 自适应地形（Delaunay + 密集边界点）\n")
             of.write(f"mtllib {os.path.basename(mtl_path)}\n")
             of.write("o Terrain\n")
 
@@ -302,40 +320,92 @@ class AdaptiveTerrainBuilder:
                 for i0, i1, i2, _ in faces_by_mat[mat_id]:
                     of.write(f"f {i0+1}/{i0+1}/{i0+1} {i1+1}/{i1+1}/{i1+1} {i2+1}/{i2+1}/{i2+1}\n")
 
-        print(f"Done! OBJ: {obj_path} ({os.path.getsize(obj_path)/1e6:.1f} MB)")
+        print(f"完成! OBJ: {obj_path} ({os.path.getsize(obj_path)/1e6:.1f} MB)")
 
     def build(self):
+        """完整构建流程。"""
         t0 = time.time()
         self.load()
         self.build_delaunay()
         self.build_mesh()
         self.export()
-        print(f"Total time: {time.time()-t0:.1f}s")
+        print(f"总耗时: {time.time()-t0:.1f}s")
 
 
 # ═══════════════════════════════════════════════════════════════
-# 入口
+# 完整管线入口（唯一 main）
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    p = argparse.ArgumentParser(description="Adaptive UE terrain generator")
+    """完整流程入口：分类 → 后处理 → 3DGS语义地图 → 自适应地形OBJ。"""
+    p = argparse.ArgumentParser(description="3DMapRebuilder 自适应地形生成器")
     p.add_argument("--label-dir", default="TestInput/SanHe", help="labels.tif 所在目录")
     p.add_argument("--dem", default="TestInput/SanHe/dem.tif", help="DEM 路径")
-    p.add_argument("--out-dir", default="output/terrain_adaptive", help="输出目录")
+    p.add_argument("--out-dir", default="output/terrain_adaptive", help="地形 OBJ 输出目录")
     p.add_argument("--boundary-step", type=int, default=BOUNDARY_SAMPLE_STEP, help="边界采样步长")
+    p.add_argument("--force", action="store_true",
+                   help="强制重新生成所有中间文件；默认会利用已有文件")
     args = p.parse_args()
 
-    label_10x_path = os.path.join(args.label_dir, "Output_10x", "labels_10x_no_boundary.tif")
-    boundary_path = os.path.join(args.label_dir, "Output_10x", "boundary_lines_10x.png")
+    label_dir = args.label_dir
+    label_path = os.path.join(label_dir, "labels.tif")
+    out_10x = os.path.join(label_dir, "Output_10x")
+    label_10x_path = os.path.join(out_10x, "labels_10x_no_boundary.tif")
+    boundary_path = os.path.join(out_10x, "boundary_lines_10x.png")
+    semantic_ply = os.path.join(label_dir, "semanticMap.ply")
 
-    builder = AdaptiveTerrainBuilder(
+    vec_path = os.path.join(label_dir, "vec_raw.png")
+    sate_path = os.path.join(label_dir, "satellite.tif")
+
+    # 1. 语义分类
+    if not args.force and os.path.exists(label_path):
+        print(f"使用已有: {label_path}")
+    else:
+        print("=" * 60)
+        print("Stage 1/4: 语义分类")
+        print("=" * 60)
+        clf = VecClassifier()
+        clf.set_input(vec_path, sate_path)
+        clf.set_output(label_dir)
+        clf.run()
+
+    # 2. 标签后处理
+    if not args.force and os.path.exists(label_10x_path) and os.path.exists(boundary_path):
+        print(f"使用已有: {label_10x_path}, {boundary_path}")
+    else:
+        print("=" * 60)
+        print("Stage 2/4: 标签后处理")
+        print("=" * 60)
+        pp = LabelPostprocessor(input_path=label_path, output_dir=out_10x)
+        pp.process()
+
+    # 3. 简化 3DGS 语义地图
+    if not args.force and os.path.exists(semantic_ply):
+        print(f"使用已有: {semantic_ply}")
+    else:
+        print("=" * 60)
+        print("Stage 3/4: 简化 3DGS 语义地图")
+        print("=" * 60)
+        builder = SemanticMapBuilder(label_path=label_path, dem_path=args.dem, out_path=semantic_ply)
+        builder.build()
+
+    # 4. 自适应地形 OBJ
+    print("=" * 60)
+    print("Stage 4/4: 自适应地形 OBJ")
+    print("=" * 60)
+    terrain_builder = AdaptiveTerrainBuilder(
         label_10x_path=label_10x_path,
         boundary_path=boundary_path,
         dem_path=args.dem,
         out_dir=args.out_dir,
         boundary_sample_step=args.boundary_step,
     )
-    builder.build()
+    terrain_builder.build()
+
+
+def test():
+    """完整管线测试入口（默认重新生成所有文件）。"""
+    main()
 
 
 if __name__ == "__main__":

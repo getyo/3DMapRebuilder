@@ -10,11 +10,6 @@
 """
 
 import os
-import sys
-
-# 确保脚本所在目录在导入路径中（兼容 standalone 运行）
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import cv2
 import numpy as np
 import scipy.ndimage
@@ -27,7 +22,6 @@ except ImportError:
 
 from classify_vecw import VecClassifier, SANHE_VEC, SANHE_SATE, SANHE_LABEL_DIR
 from gen_semantic import SemanticMapBuilder
-from gen_adaptive_terrain import AdaptiveTerrainBuilder
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -356,37 +350,15 @@ class LabelPostprocessor:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 入口
+# 独立测试入口
 # ═══════════════════════════════════════════════════════════════
 
-def main():
-    """完整流程入口：分类 → 后处理 → 3DGS语义地图 → 自适应地形OBJ"""
-    # 1. 语义分类
-    classifier = VecClassifier()
-    classifier.set_input(SANHE_VEC, SANHE_SATE)
-    classifier.set_output(SANHE_LABEL_DIR)
-    classifier.run()
-
-    # 2. 标签后处理（10x 上采样 + 轮廓平滑）
-    postprocessor = LabelPostprocessor(
-        input_path=classifier.label_out,
-        output_dir=os.path.join(SANHE_LABEL_DIR, "Output_10x")
-    )
-    postprocessor.process()
-
-    # 3. 语义地图生成（简化版 3DGS 点云）
-    semantic_builder = SemanticMapBuilder(label_path=classifier.label_out)
-    semantic_builder.build()
-
-    # 4. 自适应分辨率地形 OBJ（供 UE 使用）
-    terrain_builder = AdaptiveTerrainBuilder(
-        label_10x_path=os.path.join(SANHE_LABEL_DIR, "Output_10x", "labels_10x_no_boundary.tif"),
-        boundary_path=os.path.join(SANHE_LABEL_DIR, "Output_10x", "boundary_lines_10x.png"),
-        dem_path=os.path.join(SANHE_LABEL_DIR, "dem.tif"),
-        out_dir=os.path.join(SANHE_LABEL_DIR, "Output_10x", "terrain_adaptive"),
-    )
-    terrain_builder.build()
+def test():
+    """检测标签后处理器输入是否有效，无效则报错，有效则运行。"""
+    pp = LabelPostprocessor()
+    if not os.path.isfile(pp.input_path):
+        raise FileNotFoundError(f"缺少输入: {pp.input_path}")
+    pp.process()
 
 
-if __name__ == "__main__":
-    main()
+# 本模块不持有 main 入口，由 gen_adaptive_terrain.py 统一调度。

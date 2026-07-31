@@ -263,5 +263,15 @@ class VecClassifier:
         print(f"  Saved {os.path.basename(self.label_out)}")
 
 
-# ============ 5. 入口 ============
-# 主入口已迁移至 label_postprocess.py
+# ============ 5. 独立测试入口 ============
+
+def test():
+    """检测分类器输入是否有效，无效则报错，有效则运行。"""
+    clf = VecClassifier()
+    clf.set_input(SANHE_VEC, SANHE_SATE)
+    clf.set_output(SANHE_LABEL_DIR)
+    clf._check_paths()
+    clf.run()
+
+
+# 本模块不持有 main 入口，由 gen_adaptive_terrain.py 统一调度。

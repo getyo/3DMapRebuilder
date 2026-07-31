@@ -451,6 +451,16 @@ class SemanticMapBuilder:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 入口
+# 独立测试入口
 # ═══════════════════════════════════════════════════════════════
-# 主入口已迁移至 label_postprocess.py
+
+def test():
+    """检测 3DGS 生成器输入是否有效，无效则报错，有效则运行。"""
+    builder = SemanticMapBuilder()
+    for pth in (builder.label_path, builder.dem_path):
+        if not os.path.isfile(pth):
+            raise FileNotFoundError(f"缺少输入: {pth}")
+    builder.build()
+
+
+# 本模块不持有 main 入口，由 gen_adaptive_terrain.py 统一调度。
