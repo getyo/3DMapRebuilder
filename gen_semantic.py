@@ -453,15 +453,4 @@ class SemanticMapBuilder:
 # ═══════════════════════════════════════════════════════════════
 # 入口
 # ═══════════════════════════════════════════════════════════════
-
-def main():
-    classifier = VecClassifier()
-    classifier.set_input(SANHE_VEC, SANHE_SATE)
-    classifier.set_output(SANHE_LABEL_DIR)
-    classifier.run()
-    builder = SemanticMapBuilder(label_path= classifier.label_out)
-    builder.build()
-
-
-if __name__ == '__main__':
-    main()
+# 主入口已迁移至 label_postprocess.py

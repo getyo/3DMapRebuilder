@@ -16,7 +16,7 @@
 
 ## 总体架构
 
-四层结构，已完成前两层：
+四层结构 + 标签后处理，已完成前两层与后处理：
 
 ```
 输入层（预处理，外部完成）
@@ -31,13 +31,17 @@
 │ 输出：water.tif, building.tif, road.tif, labels.tif │
 └──────────────────────────────────────────────────┘
   │
-  ▼
-┌──────────────────────────────────────────────────┐
-│ 第二层：语义地图生成（已完成 ✓）                    │
-│ gen_semantic.py :: SemanticMapBuilder             │
-│ 从 labels.tif + dem.tif 生成 3DGS 语义点云 PLY    │
-│ 输出：semanticMap.ply（含语义属性扩展）              │
-└──────────────────────────────────────────────────┘
+  ├──┬──────────────────────────────────────────────┐
+  │  │                                              │
+  ▼  ▼                                              ▼
+┌──────────────────────┐              ┌─────────────────────────────────────┐
+│ 第二层：语义地图生成   │              │ 标签后处理（已完成 ✓）               │
+│ gen_semantic.py      │              │ label_postprocess.py                │
+│ SemanticMapBuilder   │              │ LabelPostprocessor                  │
+│ 从 labels.tif + dem  │              │ 对 labels.tif 做 10x 上采样与轮廓平滑 │
+│ 生成 3DGS 语义点云 PLY│              │ 输出：labels_10x_no_boundary.tif     │
+│ 输出：semanticMap.ply │              │       boundary_lines_10x.png         │
+└──────────────────────┘              └─────────────────────────────────────┘
   │
   ▼
 ┌──────────────────────────────────────────────────┐
@@ -60,7 +64,7 @@ vec_raw.png (RGBA 矢量底图)         satellite.tif (RGB 卫星图基准)    d
        │  classify_vecw.py                       │                        │
        ▼                                        │                        │
   ┌──────────┐                                  │                        │
-  │ 颜色分类  │  ← 7 种 RGBA 颜色常量 (±2 容差)    │                        │
+  │ 颜色分类  │  ← 8 种 RGBA 颜色常量 (±1 容差)    │                        │
   └────┬─────┘                                  │                        │
        │                                         │                        │
        ├──→ water.tif (二值掩膜, class_id=0)      │                        │
@@ -81,6 +85,15 @@ vec_raw.png (RGBA 矢量底图)         satellite.tif (RGB 卫星图基准)    d
                 ▼
         semanticMap.ply
         （65 floats/vertex, 260 bytes/vertex）
+
+          label_postprocess.py
+                │
+                │  · 10x 最近邻上采样
+                │  · 水体/建筑高斯轮廓平滑
+                │  · 道路冻结拐角 + 段内 Chaikin 插值
+                │  · 道路等级继承 / 建筑高度占位
+                ▼
+   labels_10x_no_boundary.tif + boundary_lines_10x.png
 ```
 
 ## 主要类型与用法
@@ -104,7 +117,7 @@ clf.run()
 | 通道 | 内容 | 值范围 |
 |------|------|--------|
 | Band 1 (class_id) | 语义类别 | 0=水体, 20=道路, 40=建筑, 60=地面 |
-| Band 2 (road_level) | 道路等级 | 40=高速, 80=国道, 120=省道, 160=小路 |
+| Band 2 (road_level) | 道路等级 | 40=高速, 80=国道, 120=省道, 160=支路, 200=小路 |
 | Band 3 (height) | 相对高度（占位） | 120=建筑, 0=其他 |
 
 **分类优先级**：水体 > 道路 > 建筑（形态闭合） > 地面 > 透明区域（默认地面）
@@ -117,7 +130,8 @@ clf.run()
 | 高速 | 186 | 160 | 241 |
 | 国道 | 254 | 205 | 120 |
 | 省道 | 254 | 235 | 130 |
-| 小路 | 255 | 255 | 255 |
+| 支路 | 255 | 255 | 255 |
+| 小路 | 253 | 253 | 253 |
 | 建筑 | 249 | 250 | 243 |
 | 地面 | 245 | 244 | 238 |
 
@@ -183,6 +197,35 @@ builder.set_input(
 
 **墙体颜色**：橙色（屋顶色×0.5，拐角处缩至轮廓 σ 保持锐利）。
 
+### LabelPostprocessor（标签后处理器）
+
+`label_postprocess.py` 中的非单例类，对分类器输出的 `labels.tif` 做 10x 上采样与轮廓平滑。
+
+```python
+from label_postprocess import LabelPostprocessor
+
+# 方式 1：默认路径
+pp = LabelPostprocessor()
+pp.process()
+
+# 方式 2：构造时指定路径
+pp = LabelPostprocessor(
+    input_path="path/to/labels.tif",
+    output_dir="path/to/Output_10x"
+)
+pp.process()
+
+# 方式 3：链式设置
+pp = LabelPostprocessor()
+pp.set_input("path/to/labels.tif").set_output("path/to/Output_10x").process()
+```
+
+**输入**：分类器输出的 `labels.tif`（三通道语义标签）。  
+**输出**：
+- `labels_10x_no_boundary.tif`：10x 上采样后的三通道语义标签
+- `boundary_lines_10x.png`：RGBA 独立轮廓线图
+- `preview_classification_noboundary.png`：分类预览图
+
 ## 输入文件
 
 `TestInput/SanHe/` 下需要预先准备：
@@ -198,20 +241,33 @@ builder.set_input(
 ## 运行方式
 
 ```bash
-pip install numpy pillow rasterio scipy plyfile
-python classify_vecw.py     # 生成语义标签
-python gen_semantic.py      # 生成 3DGS PLY（含自动前置分类）
+pip install numpy pillow rasterio scipy plyfile opencv-python
+python label_postprocess.py   # 一键跑完全流程：分类 → 语义地图 → 标签后处理
 ```
 
-`gen_semantic.py` 的 `main()` 会自动先执行分类再建图。单独运行 `classify_vecw.py` 只执行分类。
+`label_postprocess.py` 的 `main()` 会依次执行：
+1. `VecClassifier.run()` 生成语义标签
+2. `SemanticMapBuilder.build()` 生成 3DGS PLY
+3. `LabelPostprocessor.process()` 生成 10x 上采样标签与轮廓图
+
+如需单独执行某一阶段，可直接导入对应类：
+
+```python
+from classify_vecw import VecClassifier
+from gen_semantic import SemanticMapBuilder
+from label_postprocess import LabelPostprocessor
+```
 
 ## 输出
 
 - `TestInput/SanHe/water.tif` — 水体二值掩膜
 - `TestInput/SanHe/building.tif` — 建筑二值掩膜（形态闭合）
-- `TestInput/SanHe/road.tif` — 道路二值掩膜（四级合并）
+- `TestInput/SanHe/road.tif` — 道路二值掩膜（五级合并）
 - `TestInput/SanHe/labels.tif` — 三通道语义标签
 - `TestInput/SanHe/semanticMap.ply` — 3DGS 语义点云（SIBR / gsplat viewer 可直接查看）
+- `TestInput/SanHe/Output_10x/labels_10x_no_boundary.tif` — 10x 上采样语义标签
+- `TestInput/SanHe/Output_10x/boundary_lines_10x.png` — 独立轮廓线图
+- `TestInput/SanHe/Output_10x/preview_classification_noboundary.png` — 分类预览图
 
 ## 待办
 

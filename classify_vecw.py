@@ -41,10 +41,11 @@ COLOR_GROUND   = RGBA(245, 244, 238)  # 地面
 COLOR_MAIN_ROAD   = RGBA(186, 160, 241)  # 高速  G=40
 COLOR_BRANCH_ROAD = RGBA(254, 205, 120)  # 国道  G=80
 COLOR_SMALL_ROAD  = RGBA(254, 235, 130)  # 省道  G=120
-COLOR_PATH        = RGBA(255, 255, 255)  # 小路  G=160
+COLOR_BRANCH_PATH = RGBA(255, 255, 255)  # 支路  G=160
+COLOR_PATH        = RGBA(253, 253, 253)  # 小路  G=200
 
 # RGB容差
-RGB_DIFF = 2
+RGB_DIFF = 0
 
 def _match_rgba(r, g, b, color: RGBA, opaque):
     """像素 (R,G,B) 是否匹配给定颜色(±1 容差)，且不透明"""
@@ -128,25 +129,28 @@ class VecClassifier:
 
     def _classify_road(self, r, g, b, opaque, exclude_mask):
         """
-        道路四级分类（全部 ±1)
+        道路五级分类（±1 容差）
           - 高速 → COLOR_MAIN_ROAD    G=40
           - 国道 → COLOR_BRANCH_ROAD  G=80
           - 省道 → COLOR_SMALL_ROAD   G=120
-          - 小路 → COLOR_PATH         G=160
+          - 支路 → COLOR_BRANCH_PATH  G=160
+          - 小路 → COLOR_PATH         G=200
         """
         lvl = np.zeros_like(r, dtype=np.uint8)
 
         road_highway  = _match_rgba(r, g, b, COLOR_MAIN_ROAD,   opaque) & ~exclude_mask
         road_national = _match_rgba(r, g, b, COLOR_BRANCH_ROAD, opaque) & ~exclude_mask & ~road_highway
         road_province = _match_rgba(r, g, b, COLOR_SMALL_ROAD,  opaque) & ~exclude_mask & ~road_highway & ~road_national
-        road_path     = _match_rgba(r, g, b, COLOR_PATH,        opaque) & ~exclude_mask & ~road_highway & ~road_national & ~road_province
+        road_branch   = _match_rgba(r, g, b, COLOR_BRANCH_PATH, opaque) & ~exclude_mask & ~road_highway & ~road_national & ~road_province
+        road_path     = _match_rgba(r, g, b, COLOR_PATH,        opaque) & ~exclude_mask & ~road_highway & ~road_national & ~road_province & ~road_branch
 
         lvl[road_highway]  = 40
         lvl[road_national] = 80
         lvl[road_province] = 120
-        lvl[road_path]     = 160
+        lvl[road_branch]   = 160
+        lvl[road_path]     = 200
 
-        road_all = road_highway | road_national | road_province | road_path
+        road_all = road_highway | road_national | road_province | road_branch | road_path
         return road_all, lvl
 
     def _classify_building(self, r, g, b, opaque, water_mask, exclude_mask):
@@ -194,11 +198,13 @@ class VecClassifier:
         road_highway  = road_lvl == 40
         road_national = road_lvl == 80
         road_province = road_lvl == 120
-        road_path     = road_lvl == 160
+        road_branch   = road_lvl == 160
+        road_path     = road_lvl == 200
         print(f"  Road:     {road.sum():>8,} px ({100*road.sum()/opaque.sum():.2f}%)")
         print(f"    - 高速:  {road_highway.sum():>8,} px")
         print(f"    - 国道:  {road_national.sum():>8,} px")
         print(f"    - 省道:  {road_province.sum():>8,} px")
+        print(f"    - 支路:  {road_branch.sum():>8,} px")
         print(f"    - 小路:  {road_path.sum():>8,} px")
 
         # ── 3. 建筑 ──
@@ -258,7 +264,4 @@ class VecClassifier:
 
 
 # ============ 5. 入口 ============
-classifier = VecClassifier()
-classifier.set_input(SANHE_VEC, SANHE_SATE)
-classifier.set_output(SANHE_LABEL_DIR)
-classifier.run()
+# 主入口已迁移至 label_postprocess.py
