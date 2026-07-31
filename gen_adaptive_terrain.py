@@ -10,7 +10,7 @@ gen_adaptive_terrain.py -- 自适应分辨率 UE 地形生成器
   - 每个三角形按重心 class_id 分到 4 个材质槽之一
   - 不做高斯平滑
   - 水体保留凹包/盆地
-  - 坐标系与 gen_splat.py 一致：X=east, Y=north, Z=height
+  - 坐标系：UE 左手系 Z-up（X=east, Y=-north, Z=height）
 """
 
 import os
@@ -137,7 +137,10 @@ class AdaptiveTerrainBuilder:
             mask = (img > 0).astype(np.uint8)
 
         print(f"  raw boundary pixels: {mask.sum():,}")
-        thinned = cv2.ximgproc.thinning(mask * 255)
+        # 细化为 1 像素宽的线（不依赖 cv2.ximgproc）
+        contours, _ = cv2.findContours(mask * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        thinned = np.zeros_like(mask, dtype=np.uint8)
+        cv2.drawContours(thinned, contours, -1, 255, thickness=1)
         self.boundary_mask = (thinned > 0)
         print(f"  thinned boundary pixels: {self.boundary_mask.sum():,}")
 
