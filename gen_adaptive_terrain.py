@@ -39,30 +39,41 @@ BOUNDARY_SAMPLE_STEP = 1         # 沿边界线采样步长（10x 像素）
 
 WATER_DEPTH = 7.5                # 水体最大深度（米）
 WATER_EDGE_WIDTH = 12.0          # 水边过渡宽度（米）
+BUILDING_BUFFER_DEPTH = 0.01     # 建筑裙边最大下沉深度（米）
 PX_M = 0.458                     # 原始像素地面尺寸（米）
 UE_SCALE = 100.0                 # UE 单位缩放
 
-MAT_NAMES = ["M_Ground", "M_Road", "M_Building", "M_Water"]
+MAT_NAMES = ["M_Ground", "M_Road", "M_WaterBed", "M_Building"]
 MAT_COLORS = [
     (0.55, 0.45, 0.30),   # 地面
     (0.28, 0.28, 0.30),   # 道路
+    (0.16, 0.13, 0.09),   # 水底泥沙
     (0.82, 0.78, 0.70),   # 建筑
-    (0.10, 0.18, 0.28),   # 水体
 ]
 MAT_GROUND = 0
 MAT_ROAD = 1
-MAT_BUILDING = 2
-MAT_WATER = 3
+MAT_WATER_BED = 2
+MAT_BUILDING_GROUND = 3
+
+WATER_MAT_NAMES = ["M_Water"]
+WATER_MAT_COLORS = [
+    (0.10, 0.18, 0.28),   # 水面蓝色
+]
+MAT_WATER = 0
+
+BUILDING_MAT_NAMES = ["M_Building"]
+BUILDING_MAT_COLORS = [
+    (0.82, 0.78, 0.70),   # 建筑
+]
+MAT_BUILDING = 0
 
 
 def class_to_mat(class_id):
-    """class_id → 材质槽编号"""
+    """class_id → 地面 OBJ 材质槽编号（建筑单独导出，这里用地面材质占位）"""
     if class_id == 0:
-        return MAT_WATER
+        return MAT_WATER_BED
     if class_id == 20:
         return MAT_ROAD
-    if class_id == 40:
-        return MAT_BUILDING
     return MAT_GROUND
 
 
@@ -73,8 +84,11 @@ def class_to_mat(class_id):
 class AdaptiveTerrainBuilder:
     """
     从 10x 语义标签、边界线图和 DEM 生成 UE 可用的自适应分辨率地形网格。
-    内部采用 Delaunay + 密集边界点策略：粗网格顶点保证内部低面数，
-    边界点密集采样保证边界平滑。
+    输出三个 OBJ：
+      - terrain_ground.obj：地面/道路/水体凹包 + 建筑裙边
+      - terrain_building.obj：建筑核心区域顶面
+      - terrain_water.obj：蓝色水面盖子
+    三个 OBJ 同坐标系，UE 000 对齐。
     """
 
     def __init__(
@@ -87,6 +101,7 @@ class AdaptiveTerrainBuilder:
         boundary_sample_step: int = BOUNDARY_SAMPLE_STEP,
         water_depth: float = WATER_DEPTH,
         water_edge_width: float = WATER_EDGE_WIDTH,
+        building_buffer_depth: float = BUILDING_BUFFER_DEPTH,
         ue_scale: float = UE_SCALE,
     ):
         self.label_10x_path = label_10x_path
@@ -98,6 +113,7 @@ class AdaptiveTerrainBuilder:
         self.bd_step = boundary_sample_step
         self.water_depth = water_depth
         self.water_edge_width = water_edge_width
+        self.building_buffer_depth = building_buffer_depth
         self.ue_scale = ue_scale
 
         self.H10 = self.W10 = 0
@@ -105,12 +121,19 @@ class AdaptiveTerrainBuilder:
         self.dem_10x = None
         self.water_mask = None
         self.water_depth_map = None
+        self.building_mask = None
+        self.building_dist_m = None
+        self.building_depth_map = None
         self.boundary_mask = None
 
         self.pts = None
         self.tri = None
-        self.verts = []
-        self.faces = []
+        self.verts = []            # 地面 OBJ 顶点（共享顶点）
+        self.ground_faces = []     # 地面 OBJ 面
+        self.water_verts = []      # 水面 OBJ 顶点
+        self.water_faces = []      # 水面 OBJ 面
+        self.building_verts = []   # 建筑 OBJ 顶点
+        self.building_faces = []   # 建筑 OBJ 面
 
     # ═══════════════════════════════════════════════════════════════
     # 加载与预处理
@@ -130,7 +153,9 @@ class AdaptiveTerrainBuilder:
         self.dem_10x = cv2.resize(dem_1x, (self.W10, self.H10), interpolation=cv2.INTER_LINEAR)
 
         self.water_mask = (self.class_10x == 0)
+        self.building_mask = (self.class_10x == 40)
         self._build_water_basin()
+        self._build_building_buffer()
         self._build_boundary_mask()
 
     def _build_water_basin(self):
@@ -141,6 +166,12 @@ class AdaptiveTerrainBuilder:
         self.water_depth_map = self.water_depth * (t * t * (3.0 - 2.0 * t))
         max_depth = self.water_depth_map[self.water_mask].max()
         print(f"  水体盆地深度: 0.0 ~ {max_depth:.2f} m")
+
+    def _build_building_buffer(self):
+        """基于距离变换生成建筑边界距离图（后续根据裙边范围再算深度）。"""
+        dist_px = distance_transform_edt(self.building_mask)
+        self.building_dist_m = dist_px * (PX_M / SCALE)
+        print(f"  建筑边界距离图已构建")
 
     def _build_boundary_mask(self):
         """从 boundary_lines_10x.png 提取 1 像素宽的边界线。"""
@@ -202,12 +233,72 @@ class AdaptiveTerrainBuilder:
     # ═══════════════════════════════════════════════════════════════
 
     def build_mesh(self):
-        """根据 Delaunay 结果生成带材质的三维网格。"""
+        """根据 Delaunay 结果生成地面网格、建筑网格和水面盖子网格。"""
         print("构建三维网格...")
         t0 = time.time()
         H, W = self.H10, self.W10
 
-        # 预计算顶点
+        # 第一步：收集每个三角形的重心 class
+        tri_classes = []
+        for tri in self.tri.simplices:
+            i0, i1, i2 = tri
+            p0 = self.pts[i0]
+            p1 = self.pts[i1]
+            p2 = self.pts[i2]
+
+            cr = (p0[0] + p1[0] + p2[0]) / 3.0
+            cc = (p0[1] + p1[1] + p2[1]) / 3.0
+            cr_i = int(round(np.clip(cr, 0, H - 1)))
+            cc_i = int(round(np.clip(cc, 0, W - 1)))
+            tri_classes.append((i0, i1, i2, self.class_10x[cr_i, cc_i]))
+
+        # 第二步：找出建筑裙边三角形和建筑边界顶点
+        edge_count = {}
+        for i0, i1, i2, cls_center in tri_classes:
+            if cls_center != 40:
+                continue
+            for k in range(3):
+                k1 = (k + 1) % 3
+                idx = (i0, i1, i2)
+                edge = tuple(sorted((idx[k], idx[k1])))
+                edge_count[edge] = edge_count.get(edge, 0) + 1
+
+        building_boundary_vertices = set()
+        skirt_face_flags = []
+        for i0, i1, i2, cls_center in tri_classes:
+            if cls_center != 40:
+                skirt_face_flags.append(False)
+                continue
+            is_skirt = False
+            for k in range(3):
+                k1 = (k + 1) % 3
+                idx = (i0, i1, i2)
+                edge = tuple(sorted((idx[k], idx[k1])))
+                if edge_count.get(edge, 0) == 1:
+                    is_skirt = True
+                    building_boundary_vertices.add(idx[k])
+                    building_boundary_vertices.add(idx[k1])
+            skirt_face_flags.append(is_skirt)
+
+        # 第三步：根据裙边最大距离计算建筑下沉深度图（边界处 depth=0，裙边深处 depth=1cm）
+        skirt_max_dist = 0.0
+        for (i0, i1, i2, cls_center), is_skirt in zip(tri_classes, skirt_face_flags):
+            if cls_center != 40 or not is_skirt:
+                continue
+            for idx in (i0, i1, i2):
+                r, c = int(round(self.pts[idx][0])), int(round(self.pts[idx][1]))
+                r = np.clip(r, 0, H - 1)
+                c = np.clip(c, 0, W - 1)
+                skirt_max_dist = max(skirt_max_dist, self.building_dist_m[r, c])
+
+        if skirt_max_dist > 1e-6:
+            t = np.clip(self.building_dist_m / skirt_max_dist, 0.0, 1.0)
+            self.building_depth_map = self.building_buffer_depth * (t * t * (3.0 - 2.0 * t))
+            print(f"  建筑裙边最大深度: {self.building_buffer_depth:.3f} m, 裙边最大距离: {skirt_max_dist:.3f} m")
+        else:
+            self.building_depth_map = np.zeros_like(self.building_dist_m)
+
+        # 第四步：生成共享顶点
         for r, c in self.pts:
             r = int(round(r))
             c = int(round(c))
@@ -224,48 +315,84 @@ class AdaptiveTerrainBuilder:
             dem_h = self.dem_10x[r, c]
             if cls == 0:
                 dem_h -= self.water_depth_map[r, c]
+            elif cls == 40:
+                dem_h -= self.building_depth_map[r, c]
             z = dem_h * self.ue_scale
 
             u = c / (W - 1)
-            v = 1.0 - r / (H - 1)
+            v = r / (H - 1)
 
             self.verts.append((x, y, z, u, v))
 
-        # 遍历三角形，按重心 class 分配材质
-        for tri in self.tri.simplices:
-            i0, i1, i2 = tri
+        # 第五步：分配面到对应 OBJ
+        for (i0, i1, i2, cls_center), is_skirt in zip(tri_classes, skirt_face_flags):
             p0 = self.pts[i0]
             p1 = self.pts[i1]
             p2 = self.pts[i2]
-
-            cr = (p0[0] + p1[0] + p2[0]) / 3.0
-            cc = (p0[1] + p1[1] + p2[1]) / 3.0
-            cr_i = int(round(np.clip(cr, 0, H - 1)))
-            cc_i = int(round(np.clip(cc, 0, W - 1)))
-            mat = class_to_mat(self.class_10x[cr_i, cc_i])
 
             # 统一朝向
             cross = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
             if cross < 0:
                 i0, i1 = i1, i0
 
-            self.faces.append((i0, i1, i2, mat))
+            if cls_center == 0:
+                # 水体：地面 OBJ 中凹包用深色泥沙
+                self.ground_faces.append((i0, i1, i2, MAT_WATER_BED))
+                # 生成蓝色水面盖子
+                water_vis = []
+                for idx in (i0, i1, i2):
+                    x, y, _, u, v = self.verts[idx]
+                    pr, pc = int(round(self.pts[idx][0])), int(round(self.pts[idx][1]))
+                    pr = np.clip(pr, 0, H - 1)
+                    pc = np.clip(pc, 0, W - 1)
+                    z = self.dem_10x[pr, pc] * self.ue_scale
+                    self.water_verts.append((x, y, z, u, v))
+                    water_vis.append(len(self.water_verts) - 1)
+                self.water_faces.append((water_vis[0], water_vis[1], water_vis[2], MAT_WATER))
+            elif cls_center == 40:
+                # 建筑 OBJ 包含整个建筑区域
+                building_vis = []
+                for idx in (i0, i1, i2):
+                    x, y, _, u, v = self.verts[idx]
+                    if idx in building_boundary_vertices:
+                        # 边界顶点：与地面 OBJ 同高，确保严丝合缝
+                        z = self.verts[idx][2]
+                    else:
+                        # 内部顶点：原始 DEM 高度，覆盖地面 OBJ
+                        pr, pc = int(round(self.pts[idx][0])), int(round(self.pts[idx][1]))
+                        pr = np.clip(pr, 0, H - 1)
+                        pc = np.clip(pc, 0, W - 1)
+                        z = self.dem_10x[pr, pc] * self.ue_scale
+                    self.building_verts.append((x, y, z, u, v))
+                    building_vis.append(len(self.building_verts) - 1)
+                self.building_faces.append((building_vis[0], building_vis[1], building_vis[2], MAT_BUILDING))
 
-        print(f"  顶点: {len(self.verts):,}, 三角形: {len(self.faces):,}, 耗时 {time.time()-t0:.1f}s")
+                # 裙边三角形同时留在地面 OBJ，用建筑纹理
+                if is_skirt:
+                    self.ground_faces.append((i0, i1, i2, MAT_BUILDING_GROUND))
+            else:
+                mat = class_to_mat(cls_center)
+                self.ground_faces.append((i0, i1, i2, mat))
+
+        print(f"  地面顶点: {len(self.verts):,}, 地面三角形: {len(self.ground_faces):,}")
+        print(f"  水面顶点: {len(self.water_verts):,}, 水面三角形: {len(self.water_faces):,}")
+        print(f"  建筑顶点: {len(self.building_verts):,}, 建筑三角形: {len(self.building_faces):,}")
+        print(f"  耗时 {time.time()-t0:.1f}s")
 
     # ═══════════════════════════════════════════════════════════════
     # 法线与导出
     # ═══════════════════════════════════════════════════════════════
 
-    def _compute_normals(self):
+    @staticmethod
+    def _compute_normals(verts, faces):
         """按面法线加权平均计算顶点法线。"""
-        verts = np.array([[v[0], v[1], v[2]] for v in self.verts], dtype=np.float64)
-        norms = np.zeros((len(self.verts), 3), dtype=np.float64)
+        verts_arr = np.array([[v[0], v[1], v[2]] for v in verts], dtype=np.float64)
+        norms = np.zeros((len(verts_arr), 3), dtype=np.float64)
 
-        for i0, i1, i2, _ in self.faces:
-            p0 = verts[i0]
-            p1 = verts[i1]
-            p2 = verts[i2]
+        for i0, i1, i2, _ in faces:
+            p0 = verts_arr[i0]
+            p1 = verts_arr[i1]
+            p2 = verts_arr[i2]
             fn = np.cross(p1 - p0, p2 - p0)
             nm = np.linalg.norm(fn)
             if nm > 1e-12:
@@ -279,18 +406,14 @@ class AdaptiveTerrainBuilder:
         norms /= mag
         return norms
 
-    def export(self):
-        """导出 OBJ + MTL。"""
-        os.makedirs(self.out_dir, exist_ok=True)
-        obj_path = os.path.join(self.out_dir, "terrain_adaptive.obj")
-        mtl_path = os.path.join(self.out_dir, "terrain_adaptive.mtl")
-
-        print("计算法线...")
-        norms = self._compute_normals()
+    def _write_obj(self, obj_path, mtl_path, verts, faces, mat_names, mat_colors):
+        """导出一个 OBJ + MTL。"""
+        os.makedirs(os.path.dirname(obj_path), exist_ok=True)
+        norms = self._compute_normals(verts, faces)
 
         print(f"写入 MTL: {mtl_path}")
         with open(mtl_path, "w", encoding="utf-8") as mf:
-            for name, col in zip(MAT_NAMES, MAT_COLORS):
+            for name, col in zip(mat_names, mat_colors):
                 mf.write(f"newmtl {name}\n")
                 mf.write(f"Kd {col[0]:.4f} {col[1]:.4f} {col[2]:.4f}\n")
                 mf.write("Ks 0.1 0.1 0.1\n")
@@ -302,18 +425,18 @@ class AdaptiveTerrainBuilder:
             of.write(f"mtllib {os.path.basename(mtl_path)}\n")
             of.write("o Terrain\n")
 
-            for x, y, z, _, _ in self.verts:
+            for x, y, z, _, _ in verts:
                 of.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
             for n in norms:
                 of.write(f"vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n")
-            for _, _, _, u, v in self.verts:
+            for _, _, _, u, v in verts:
                 of.write(f"vt {u:.6f} {v:.6f}\n")
 
-            faces_by_mat = [[] for _ in MAT_NAMES]
-            for f in self.faces:
+            faces_by_mat = [[] for _ in mat_names]
+            for f in faces:
                 faces_by_mat[f[3]].append(f)
 
-            for mat_id, name in enumerate(MAT_NAMES):
+            for mat_id, name in enumerate(mat_names):
                 if not faces_by_mat[mat_id]:
                     continue
                 of.write(f"usemtl {name}\n")
@@ -321,6 +444,22 @@ class AdaptiveTerrainBuilder:
                     of.write(f"f {i0+1}/{i0+1}/{i0+1} {i1+1}/{i1+1}/{i1+1} {i2+1}/{i2+1}/{i2+1}\n")
 
         print(f"完成! OBJ: {obj_path} ({os.path.getsize(obj_path)/1e6:.1f} MB)")
+
+    def export(self):
+        """导出 terrain_ground.obj + terrain_water.obj + terrain_building.obj。"""
+        ground_obj = os.path.join(self.out_dir, "terrain_ground.obj")
+        ground_mtl = os.path.join(self.out_dir, "terrain_ground.mtl")
+        water_obj = os.path.join(self.out_dir, "terrain_water.obj")
+        water_mtl = os.path.join(self.out_dir, "terrain_water.mtl")
+        building_obj = os.path.join(self.out_dir, "terrain_building.obj")
+        building_mtl = os.path.join(self.out_dir, "terrain_building.mtl")
+
+        self._write_obj(ground_obj, ground_mtl, self.verts, self.ground_faces,
+                        MAT_NAMES, MAT_COLORS)
+        self._write_obj(water_obj, water_mtl, self.water_verts, self.water_faces,
+                        WATER_MAT_NAMES, WATER_MAT_COLORS)
+        self._write_obj(building_obj, building_mtl, self.building_verts, self.building_faces,
+                        BUILDING_MAT_NAMES, BUILDING_MAT_COLORS)
 
     def build(self):
         """完整构建流程。"""
