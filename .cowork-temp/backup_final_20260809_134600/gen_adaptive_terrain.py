@@ -11,10 +11,10 @@ gen_adaptive_terrain.py -- 自适应分辨率 UE 地形生成器
 其他模块仅通过 test() 方法自检输入并运行，不持有 main 入口。
 """
 
-import argparse
+import os
 import sys
 import time
-from pathlib import Path
+import argparse
 
 import numpy as np
 import rasterio
@@ -23,7 +23,7 @@ from scipy.ndimage import distance_transform_edt
 from scipy.spatial import Delaunay
 
 # 添加脚本目录到导入路径，确保 standalone 运行能找到同级模块
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from classify_vecw import VecClassifier
 from gen_semantic import SemanticMapBuilder
 from label_postprocess import LabelPostprocessor
@@ -68,12 +68,13 @@ BUILDING_MAT_COLORS = [
 MAT_BUILDING = 0
 
 
-def class_to_mat(class_ids):
-    """class_id → 地面 OBJ 材质槽编号（向量化）"""
-    result = np.full(np.asarray(class_ids).shape, MAT_GROUND, dtype=np.int32)
-    result[class_ids == 0] = MAT_WATER_BED
-    result[class_ids == 20] = MAT_ROAD
-    return result
+def class_to_mat(class_id):
+    """class_id → 地面 OBJ 材质槽编号（建筑单独导出，这里用地面材质占位）"""
+    if class_id == 0:
+        return MAT_WATER_BED
+    if class_id == 20:
+        return MAT_ROAD
+    return MAT_GROUND
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -237,15 +238,19 @@ class AdaptiveTerrainBuilder:
         t0 = time.time()
         H, W = self.H10, self.W10
 
-        # 第一步：收集每个三角形的重心 class（向量化）
-        simplices = self.tri.simplices
-        pts_tri = self.pts[simplices]
-        centroids = pts_tri.mean(axis=1)
-        cr_i = np.clip(np.round(centroids[:, 0]).astype(np.int64), 0, H - 1)
-        cc_i = np.clip(np.round(centroids[:, 1]).astype(np.int64), 0, W - 1)
-        tri_cls_arr = self.class_10x[cr_i, cc_i]
-        tri_classes = [(int(s[0]), int(s[1]), int(s[2]), int(c))
-                       for s, c in zip(simplices, tri_cls_arr)]
+        # 第一步：收集每个三角形的重心 class
+        tri_classes = []
+        for tri in self.tri.simplices:
+            i0, i1, i2 = tri
+            p0 = self.pts[i0]
+            p1 = self.pts[i1]
+            p2 = self.pts[i2]
+
+            cr = (p0[0] + p1[0] + p2[0]) / 3.0
+            cc = (p0[1] + p1[1] + p2[1]) / 3.0
+            cr_i = int(round(np.clip(cr, 0, H - 1)))
+            cc_i = int(round(np.clip(cc, 0, W - 1)))
+            tri_classes.append((i0, i1, i2, self.class_10x[cr_i, cc_i]))
 
         # 第二步：找出建筑裙边三角形和建筑边界顶点
         edge_count = {}
@@ -293,45 +298,49 @@ class AdaptiveTerrainBuilder:
         else:
             self.building_depth_map = np.zeros_like(self.building_dist_m)
 
-        # 第四步：生成共享顶点（向量化）
-        r = np.clip(np.round(self.pts[:, 0]).astype(np.int64), 0, H - 1)
-        c = np.clip(np.round(self.pts[:, 1]).astype(np.int64), 0, W - 1)
-        x = (c / SCALE) * PX_M * self.ue_scale
-        y = -((r / SCALE) * PX_M * self.ue_scale)
-        x -= (W / SCALE) * PX_M * self.ue_scale * 0.5
-        y += (H / SCALE) * PX_M * self.ue_scale * 0.5
-        cls = self.class_10x[r, c]
-        dem_h = self.dem_10x[r, c].copy()
-        water_m = cls == 0
-        bld_m = cls == 40
-        if np.any(water_m):
-            dem_h[water_m] -= self.water_depth_map[r[water_m], c[water_m]]
-        if np.any(bld_m):
-            dem_h[bld_m] -= self.building_depth_map[r[bld_m], c[bld_m]]
-        z = dem_h * self.ue_scale
-        u = c / (W - 1)
-        v = r / (H - 1)
-        self.verts = list(zip(x, y, z, u, v))
+        # 第四步：生成共享顶点
+        for r, c in self.pts:
+            r = int(round(r))
+            c = int(round(c))
+            r = np.clip(r, 0, H - 1)
+            c = np.clip(c, 0, W - 1)
 
-        # 统一朝向（向量化）
-        p0 = self.pts[simplices[:, 0]]
-        p1 = self.pts[simplices[:, 1]]
-        p2 = self.pts[simplices[:, 2]]
-        cross = (p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) - (p1[:, 1] - p0[:, 1]) * (p2[:, 0] - p0[:, 0])
-        needs_swap = cross < 0
-        swapped = simplices.copy()
-        swapped[needs_swap, 0], swapped[needs_swap, 1] = swapped[needs_swap, 1], swapped[needs_swap, 0]
+            # UE 左手系 Z-up：X=east, Y=-north, Z=height
+            x = (c / SCALE) * PX_M * self.ue_scale
+            y = -((r / SCALE) * PX_M * self.ue_scale)
+            x -= (W / SCALE) * PX_M * self.ue_scale * 0.5
+            y += (H / SCALE) * PX_M * self.ue_scale * 0.5
 
-        # 第五步：分配面到对应 OBJ（逻辑密集，保留循环）
-        for tri_idx, ((i0, i1, i2, cls_center), is_skirt) in enumerate(zip(tri_classes, skirt_face_flags)):
-            s0, s1, s2 = swapped[tri_idx]
+            cls = self.class_10x[r, c]
+            dem_h = self.dem_10x[r, c]
+            if cls == 0:
+                dem_h -= self.water_depth_map[r, c]
+            elif cls == 40:
+                dem_h -= self.building_depth_map[r, c]
+            z = dem_h * self.ue_scale
+
+            u = c / (W - 1)
+            v = r / (H - 1)
+
+            self.verts.append((x, y, z, u, v))
+
+        # 第五步：分配面到对应 OBJ
+        for (i0, i1, i2, cls_center), is_skirt in zip(tri_classes, skirt_face_flags):
+            p0 = self.pts[i0]
+            p1 = self.pts[i1]
+            p2 = self.pts[i2]
+
+            # 统一朝向
+            cross = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
+            if cross < 0:
+                i0, i1 = i1, i0
 
             if cls_center == 0:
                 # 水体：地面 OBJ 中凹包用深色泥沙
-                self.ground_faces.append((s0, s1, s2, MAT_WATER_BED))
+                self.ground_faces.append((i0, i1, i2, MAT_WATER_BED))
                 # 生成蓝色水面盖子
                 water_vis = []
-                for idx in (s0, s1, s2):
+                for idx in (i0, i1, i2):
                     x, y, _, u, v = self.verts[idx]
                     pr, pc = int(round(self.pts[idx][0])), int(round(self.pts[idx][1]))
                     pr = np.clip(pr, 0, H - 1)
@@ -343,7 +352,7 @@ class AdaptiveTerrainBuilder:
             elif cls_center == 40:
                 # 建筑 OBJ 包含整个建筑区域
                 building_vis = []
-                for idx in (s0, s1, s2):
+                for idx in (i0, i1, i2):
                     x, y, _, u, v = self.verts[idx]
                     if idx in building_boundary_vertices:
                         # 边界顶点：与地面 OBJ 同高，确保严丝合缝
@@ -360,10 +369,10 @@ class AdaptiveTerrainBuilder:
 
                 # 裙边三角形同时留在地面 OBJ，用建筑纹理
                 if is_skirt:
-                    self.ground_faces.append((s0, s1, s2, MAT_BUILDING_GROUND))
+                    self.ground_faces.append((i0, i1, i2, MAT_BUILDING_GROUND))
             else:
                 mat = class_to_mat(cls_center)
-                self.ground_faces.append((s0, s1, s2, mat))
+                self.ground_faces.append((i0, i1, i2, mat))
 
         print(f"  地面顶点: {len(self.verts):,}, 地面三角形: {len(self.ground_faces):,}")
         print(f"  水面顶点: {len(self.water_verts):,}, 水面三角形: {len(self.water_faces):,}")
@@ -376,79 +385,74 @@ class AdaptiveTerrainBuilder:
 
     @staticmethod
     def _compute_normals(verts, faces):
-        """按面法线加权平均计算顶点法线（NumPy 向量化）。"""
+        """按面法线加权平均计算顶点法线。"""
         verts_arr = np.array([[v[0], v[1], v[2]] for v in verts], dtype=np.float64)
         norms = np.zeros((len(verts_arr), 3), dtype=np.float64)
-        faces_arr = np.array(faces, dtype=np.int64)
-        i0, i1, i2 = faces_arr[:, 0], faces_arr[:, 1], faces_arr[:, 2]
-        p0 = verts_arr[i0]
-        p1 = verts_arr[i1]
-        p2 = verts_arr[i2]
-        fn = np.cross(p1 - p0, p2 - p0)
-        nm = np.linalg.norm(fn, axis=1, keepdims=True)
-        nm[nm < 1e-12] = 1.0
-        fn /= nm
-        np.add.at(norms, i0, fn)
-        np.add.at(norms, i1, fn)
-        np.add.at(norms, i2, fn)
+
+        for i0, i1, i2, _ in faces:
+            p0 = verts_arr[i0]
+            p1 = verts_arr[i1]
+            p2 = verts_arr[i2]
+            fn = np.cross(p1 - p0, p2 - p0)
+            nm = np.linalg.norm(fn)
+            if nm > 1e-12:
+                fn /= nm
+            norms[i0] += fn
+            norms[i1] += fn
+            norms[i2] += fn
+
         mag = np.linalg.norm(norms, axis=1, keepdims=True)
         mag[mag < 1e-12] = 1.0
         norms /= mag
         return norms
 
     def _write_obj(self, obj_path, mtl_path, verts, faces, mat_names, mat_colors):
-        """导出一个 OBJ + MTL（批量字符串拼接优化）。"""
-        obj_path = Path(obj_path)
-        mtl_path = Path(mtl_path)
-        obj_path.parent.mkdir(parents=True, exist_ok=True)
+        """导出一个 OBJ + MTL。"""
+        os.makedirs(os.path.dirname(obj_path), exist_ok=True)
         norms = self._compute_normals(verts, faces)
 
-        # MTL
-        mtl_lines = []
-        for name, col in zip(mat_names, mat_colors):
-            mtl_lines.append(f"newmtl {name}\n")
-            mtl_lines.append(f"Kd {col[0]:.4f} {col[1]:.4f} {col[2]:.4f}\n")
-            mtl_lines.append("Ks 0.1 0.1 0.1\n")
-            mtl_lines.append("Ns 32.0\n\n")
-        mtl_path.write_text("".join(mtl_lines), encoding="utf-8")
         print(f"写入 MTL: {mtl_path}")
+        with open(mtl_path, "w", encoding="utf-8") as mf:
+            for name, col in zip(mat_names, mat_colors):
+                mf.write(f"newmtl {name}\n")
+                mf.write(f"Kd {col[0]:.4f} {col[1]:.4f} {col[2]:.4f}\n")
+                mf.write("Ks 0.1 0.1 0.1\n")
+                mf.write("Ns 32.0\n\n")
 
-        # OBJ —— 批量构建字符串
-        lines = []
-        lines.append("# 自适应地形（Delaunay + 密集边界点）\n")
-        lines.append(f"mtllib {mtl_path.name}\n")
-        lines.append("o Terrain\n")
+        print(f"写入 OBJ: {obj_path}")
+        with open(obj_path, "w", encoding="utf-8") as of:
+            of.write("# 自适应地形（Delaunay + 密集边界点）\n")
+            of.write(f"mtllib {os.path.basename(mtl_path)}\n")
+            of.write("o Terrain\n")
 
-        for x, y, z, _, _ in verts:
-            lines.append(f"v {x:.6f} {y:.6f} {z:.6f}\n")
-        for n in norms:
-            lines.append(f"vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n")
-        for _, _, _, u, v in verts:
-            lines.append(f"vt {u:.6f} {v:.6f}\n")
+            for x, y, z, _, _ in verts:
+                of.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+            for n in norms:
+                of.write(f"vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n")
+            for _, _, _, u, v in verts:
+                of.write(f"vt {u:.6f} {v:.6f}\n")
 
-        faces_by_mat = [[] for _ in mat_names]
-        for f in faces:
-            faces_by_mat[f[3]].append(f)
+            faces_by_mat = [[] for _ in mat_names]
+            for f in faces:
+                faces_by_mat[f[3]].append(f)
 
-        for mat_id, name in enumerate(mat_names):
-            if not faces_by_mat[mat_id]:
-                continue
-            lines.append(f"usemtl {name}\n")
-            for i0, i1, i2, _ in faces_by_mat[mat_id]:
-                lines.append(f"f {i0+1}/{i0+1}/{i0+1} {i1+1}/{i1+1}/{i1+1} {i2+1}/{i2+1}/{i2+1}\n")
+            for mat_id, name in enumerate(mat_names):
+                if not faces_by_mat[mat_id]:
+                    continue
+                of.write(f"usemtl {name}\n")
+                for i0, i1, i2, _ in faces_by_mat[mat_id]:
+                    of.write(f"f {i0+1}/{i0+1}/{i0+1} {i1+1}/{i1+1}/{i1+1} {i2+1}/{i2+1}/{i2+1}\n")
 
-        obj_path.write_text("".join(lines), encoding="utf-8")
-        print(f"写入 OBJ: {obj_path} ({obj_path.stat().st_size/1e6:.1f} MB)")
+        print(f"完成! OBJ: {obj_path} ({os.path.getsize(obj_path)/1e6:.1f} MB)")
 
     def export(self):
         """导出 terrain_ground.obj + terrain_water.obj + terrain_building.obj。"""
-        out = Path(self.out_dir)
-        ground_obj = out / "terrain_ground.obj"
-        ground_mtl = out / "terrain_ground.mtl"
-        water_obj = out / "terrain_water.obj"
-        water_mtl = out / "terrain_water.mtl"
-        building_obj = out / "terrain_building.obj"
-        building_mtl = out / "terrain_building.mtl"
+        ground_obj = os.path.join(self.out_dir, "terrain_ground.obj")
+        ground_mtl = os.path.join(self.out_dir, "terrain_ground.mtl")
+        water_obj = os.path.join(self.out_dir, "terrain_water.obj")
+        water_mtl = os.path.join(self.out_dir, "terrain_water.mtl")
+        building_obj = os.path.join(self.out_dir, "terrain_building.obj")
+        building_mtl = os.path.join(self.out_dir, "terrain_building.mtl")
 
         self._write_obj(ground_obj, ground_mtl, self.verts, self.ground_faces,
                         MAT_NAMES, MAT_COLORS)
@@ -482,18 +486,18 @@ def main():
                    help="强制重新生成所有中间文件；默认会利用已有文件")
     args = p.parse_args()
 
-    label_dir = Path(args.label_dir)
-    label_path = str(label_dir / "labels.tif")
-    out_10x = str(label_dir / "Output_10x")
-    label_10x_path = str(label_dir / "Output_10x" / "labels_10x_no_boundary.tif")
-    boundary_path = str(label_dir / "Output_10x" / "boundary_lines_10x.png")
-    semantic_ply = str(label_dir / "semanticMap.ply")
+    label_dir = args.label_dir
+    label_path = os.path.join(label_dir, "labels.tif")
+    out_10x = os.path.join(label_dir, "Output_10x")
+    label_10x_path = os.path.join(out_10x, "labels_10x_no_boundary.tif")
+    boundary_path = os.path.join(out_10x, "boundary_lines_10x.png")
+    semantic_ply = os.path.join(label_dir, "semanticMap.ply")
 
-    vec_path = str(label_dir / "vec_raw.png")
-    sate_path = str(label_dir / "satellite.tif")
+    vec_path = os.path.join(label_dir, "vec_raw.png")
+    sate_path = os.path.join(label_dir, "satellite.tif")
 
     # 1. 语义分类
-    if not args.force and Path(label_path).exists():
+    if not args.force and os.path.exists(label_path):
         print(f"使用已有: {label_path}")
     else:
         print("=" * 60)
@@ -501,11 +505,11 @@ def main():
         print("=" * 60)
         clf = VecClassifier()
         clf.set_input(vec_path, sate_path)
-        clf.set_output(str(label_dir))
+        clf.set_output(label_dir)
         clf.run()
 
     # 2. 标签后处理
-    if not args.force and Path(label_10x_path).exists() and Path(boundary_path).exists():
+    if not args.force and os.path.exists(label_10x_path) and os.path.exists(boundary_path):
         print(f"使用已有: {label_10x_path}, {boundary_path}")
     else:
         print("=" * 60)
@@ -515,7 +519,7 @@ def main():
         pp.process()
 
     # 3. 简化 3DGS 语义地图
-    if not args.force and Path(semantic_ply).exists():
+    if not args.force and os.path.exists(semantic_ply):
         print(f"使用已有: {semantic_ply}")
     else:
         print("=" * 60)

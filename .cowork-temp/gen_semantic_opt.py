@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-语义地图 3DGS PLY 生成器 — OOP 重构
+语义地图 3DGS PLY 生成器 — OOP 重构（向量化版）
 
 架构:
   PLYFile          — 纯数据格式定义 (字段/字节偏移/类型/读写)
-  SemanticMapBuilder — 全局单例, 持有所有参数 + build() 主流程
+  SemanticMapBuilder — 普通类, 持有所有参数 + build() 主流程
   main()            — 入口
 """
 
@@ -28,7 +28,7 @@ from plyfile import PlyData
 class PLYFile:
     """
     标准 3DGS PLY binary_little_endian + 语义扩展属性
-    
+
     每个顶点 260 字节 (65 × float32):
       bytes  0- 23: xyz + nx,ny,nz (6 floats)
       bytes 24- 35: f_dc_0..2 (3 floats)
@@ -80,12 +80,11 @@ class PLYFile:
     @classmethod
     def read(cls, path: str):
         """读取 PLY 文件返回结构化数组"""
-        
         return PlyData.read(path)['vertex'].data
 
 
 # ═══════════════════════════════════════════════════════════════
-# 语义地图构建器 (全局单例)
+# 语义地图构建器 (普通类)
 # ═══════════════════════════════════════════════════════════════
 
 class SemanticMapBuilder:
@@ -97,13 +96,8 @@ class SemanticMapBuilder:
       b.build()
     """
 
-    # 默认 I/O 路径（实例参数，非类级全局）
-    _DEFAULT_LABEL = 'TestInput/SanHe/labels.tif'
-    _DEFAULT_DEM   = 'TestInput/SanHe/dem.tif'
-    _DEFAULT_OUT   = 'TestInput/SanHe/semanticMap.ply'
-
     # ═══════════════════════════════════════════
-    # 静态配置 — 几何参数
+    # 静态常量 — 几何参数
     # ═══════════════════════════════════════════
     PX_M         = 0.458      # 像素地面尺寸 (m)
     BUILD_MIN_H  = 3.0        # 建筑最小高度 (m)
@@ -111,7 +105,7 @@ class SemanticMapBuilder:
     M_DEG_LAT    = 111111.0   # 每度纬度 ≈ 米
 
     # ═══════════════════════════════════════════
-    # 静态配置 — 高斯尺度 (sigma)
+    # 静态常量 — 高斯尺度 (sigma)
     # ═══════════════════════════════════════════
     SIGMA_H             = 0.7     # 内部水平 σ (3σ=2.1m 填充面)
     SIGMA_CONTOUR       = 0.001   # 轮廓 σ (屋顶垂直/地面边界/墙面拐角统一)
@@ -120,13 +114,13 @@ class SemanticMapBuilder:
     WALL_THICK_NORMAL   = 0.5     # 墙面直边 法向 σ
 
     # ═══════════════════════════════════════════
-    # 静态配置 — 渲染
+    # 静态常量 — 渲染
     # ═══════════════════════════════════════════
     SH_C0       = 0.28209479177387814  # 球谐 DC 归一化系数
     OPACITY     = 0.95                 # 全局不透明度
 
     # ═══════════════════════════════════════════
-    # 静态配置 — 颜色定义 (RGB [0,1])
+    # 静态常量 — 颜色定义 (RGB [0,1])
     # ═══════════════════════════════════════════
     COLOR_WATER    = (100/255, 180/255, 255/255)  # 浅蓝
     COLOR_GROUND   = (180/255, 150/255, 100/255)  # 棕
@@ -153,17 +147,18 @@ class SemanticMapBuilder:
     @staticmethod
     def _rgb_to_sh_dc(r, g, b):
         """RGB → 球谐 DC 系数"""
-        return ((r - 0.5) / SemanticMapBuilder.SH_C0,
-                (g - 0.5) / SemanticMapBuilder.SH_C0,
-                (b - 0.5) / SemanticMapBuilder.SH_C0)
+        sh_c0 = SemanticMapBuilder.SH_C0
+        return ((r - 0.5) / sh_c0,
+                (g - 0.5) / sh_c0,
+                (b - 0.5) / sh_c0)
 
     # ═══════════════════════════════════════════
     # 实例初始化
     # ═══════════════════════════════════════════
     def __init__(self, label_path=None, dem_path=None, out_path=None):
-        self.label_path = label_path or self._DEFAULT_LABEL
-        self.dem_path   = dem_path   or self._DEFAULT_DEM
-        self.out_path   = out_path   or self._DEFAULT_OUT
+        self.label_path = label_path or 'TestInput/SanHe/labels.tif'
+        self.dem_path   = dem_path   or 'TestInput/SanHe/dem.tif'
+        self.out_path   = out_path   or 'TestInput/SanHe/semanticMap.ply'
 
         # 运行时数据
         self._class_id   = None
@@ -215,15 +210,16 @@ class SemanticMapBuilder:
     # 内部 — 建筑高度
     # ═══════════════════════════════════════════
     def _build_heights(self):
+        """按连通区域分配高度（循环规模 = 区域数，通常 <10k，非性能瓶颈）。"""
         self._bld_mask = self._class_id == 40
         bld_labels, n = ndimage.label(self._bld_mask)
         self._bld_h = np.zeros_like(self._dem, dtype=np.float32)
         np.random.seed(42)
-        for lbl in range(1, n+1):
+        for lbl in range(1, n + 1):
             mask = bld_labels == lbl
             sz = mask.sum()
             if sz > 10:
-                h = self.BUILD_MIN_H + (self.BUILD_MAX_H - self.BUILD_MIN_H) * (1 - math.exp(-sz/5000))
+                h = self.BUILD_MIN_H + (self.BUILD_MAX_H - self.BUILD_MIN_H) * (1 - np.exp(-sz / 5000))
                 h += np.random.uniform(-0.5, 0.5)
                 h = np.clip(h, self.BUILD_MIN_H, self.BUILD_MAX_H)
             else:
@@ -235,17 +231,17 @@ class SemanticMapBuilder:
     # ═══════════════════════════════════════════
     def _detect_edges(self):
         # 语义边界: 4邻域不同类
-        U = np.roll(self._class_id, -1,0); U[-1,:]=0
-        D = np.roll(self._class_id,  1,0); D[ 0,:]=0
-        L = np.roll(self._class_id, -1,1); L[:,-1]=0
-        R = np.roll(self._class_id,  1,1); R[:, 0]=0
+        U = np.roll(self._class_id, -1, 0); U[-1, :] = 0
+        D = np.roll(self._class_id,  1, 0); D[ 0, :] = 0
+        L = np.roll(self._class_id, -1, 1); L[:, -1] = 0
+        R = np.roll(self._class_id,  1, 1); R[:,  0] = 0
         self._outline = (self._class_id != U) | (self._class_id != D) | (self._class_id != L) | (self._class_id != R)
 
         # 建筑拐角: 2方向同时暴露
-        U_b = np.roll(self._bld_mask, -1,0); U_b[-1,:]=False
-        D_b = np.roll(self._bld_mask,  1,0); D_b[ 0,:]=False
-        L_b = np.roll(self._bld_mask, -1,1); L_b[:,-1]=False
-        R_b = np.roll(self._bld_mask,  1,1); R_b[:, 0]=False
+        U_b = np.roll(self._bld_mask, -1, 0); U_b[-1, :] = False
+        D_b = np.roll(self._bld_mask,  1, 0); D_b[ 0, :] = False
+        L_b = np.roll(self._bld_mask, -1, 1); L_b[:, -1] = False
+        R_b = np.roll(self._bld_mask,  1, 1); R_b[:,  0] = False
         n_exposed = ((~U_b).astype(np.int32) + (~D_b).astype(np.int32) +
                      (~L_b).astype(np.int32) + (~R_b).astype(np.int32))
         self._corner = self._bld_mask & (n_exposed >= 2)
@@ -261,58 +257,95 @@ class SemanticMapBuilder:
         self._semantic[self._class_id == 20] = 3   # road
 
     # ═══════════════════════════════════════════
-    # 内部 — 像素 → 米坐标
+    # 内部 — 像素 → 米坐标（支持数组输入）
     # ═══════════════════════════════════════════
     def _px_to_meters(self, r, c):
-        lon = self._tf[2] + (c + 0.5)*self._tf[0] + (r + 0.5)*self._tf[1]
-        lat = self._tf[5] + (c + 0.5)*self._tf[3] + (r + 0.5)*self._tf[4]
+        lon = self._tf[2] + (c + 0.5) * self._tf[0] + (r + 0.5) * self._tf[1]
+        lat = self._tf[5] + (c + 0.5) * self._tf[3] + (r + 0.5) * self._tf[4]
         x = (lon - self._center_lon) * self._m_deg_lon
         y = (lat - self._center_lat) * self.M_DEG_LAT
         return x, y
 
     # ═══════════════════════════════════════════
-    # 内部 — 墙面高斯
+    # 内部 — 墙面高斯（完全向量化）
     # ═══════════════════════════════════════════
     def _build_walls(self):
-        bld_eroded = binary_erosion(self._bld_mask, structure=np.ones((3,3), dtype=bool))
+        bld_eroded = binary_erosion(self._bld_mask, structure=np.ones((3, 3), dtype=bool))
         perimeter = self._bld_mask & ~bld_eroded
         pr, pc = np.where(perimeter)
+        if len(pr) == 0:
+            return PLYFile.create_array(0)
 
-        # 墙面颜色 SH DC
         sh_w = self._rgb_to_sh_dc(*self.COLOR_WALL)
         op_log = math.log(self.OPACITY / (1 - self.OPACITY))
 
-        walls = []
-        for i in range(len(pr)):
-            r, c = int(pr[i]), int(pc[i])
-            h = float(self._bld_h[r, c])
-            if h <= 0.5: continue
+        all_chunks = []
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr = pr + dr
+            nc = pc + dc
+            valid = (nr >= 0) & (nr < self._height) & (nc >= 0) & (nc < self._width) & (~self._bld_mask[nr, nc])
+            if not np.any(valid):
+                continue
 
-            x_center, y_center = self._px_to_meters(r, c)
-            elev = float(self._dem[r, c])
-            n_wall = max(1, int(h / self.WALL_STEP))
+            pr_v = pr[valid]
+            pc_v = pc[valid]
+            h = self._bld_h[pr_v, pc_v]
+            mask_high = h > 0.5
+            if not np.any(mask_high):
+                continue
+
+            pr_v = pr_v[mask_high]
+            pc_v = pc_v[mask_high]
+            h = h[mask_high]
+
+            x_center, y_center = self._px_to_meters(pr_v, pc_v)
+            elev = self._dem[pr_v, pc_v]
+            n_wall = np.maximum(1, (h / self.WALL_STEP).astype(np.int32))
             vert_step = h / n_wall
             sv = self._sq(vert_step * 0.4)
-            is_corner = self._corner[r, c]
-            wt = self.SIGMA_CONTOUR if is_corner else self.WALL_THICK_NORMAL
+            is_corner = self._corner[pr_v, pc_v]
+            wt = np.where(is_corner, self.SIGMA_CONTOUR, self.WALL_THICK_NORMAL)
 
-            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-                nr, nc = r + dr, c + dc
-                if nr < 0 or nr >= self._height or nc < 0 or nc >= self._width: continue
-                if self._bld_mask[nr, nc]: continue
+            n_pts = len(pr_v)
+            if dr != 0:
+                ox = np.zeros(n_pts, dtype=np.float32)
+                oz = np.full(n_pts, -0.5 * self.PX_M if dr < 0 else 0.5 * self.PX_M, dtype=np.float32)
+                s0 = np.full(n_pts, self._sq(self.SIGMA_H), dtype=np.float32)
+                s2 = self._sq(wt)
+            else:
+                ox = np.full(n_pts, -0.5 * self.PX_M if dc < 0 else 0.5 * self.PX_M, dtype=np.float32)
+                oz = np.zeros(n_pts, dtype=np.float32)
+                s0 = self._sq(wt)
+                s2 = np.full(n_pts, self._sq(self.SIGMA_H), dtype=np.float32)
 
-                if dr != 0:  # 南北面
-                    ox, oz = 0.0, (-0.5*self.PX_M if dr < 0 else 0.5*self.PX_M)
-                    s0, s2 = self._sq(self.SIGMA_H), self._sq(wt)
-                else:        # 东西面
-                    ox, oz = (-0.5*self.PX_M if dc < 0 else 0.5*self.PX_M), 0.0
-                    s0, s2 = self._sq(wt), self._sq(self.SIGMA_H)
+            total = int(n_wall.sum())
+            if total == 0:
+                continue
 
-                for wi in range(n_wall):
-                    wy = elev + (wi + 0.5) * vert_step
-                    walls.append((x_center+ox, -wy, y_center+oz,
-                                  *sh_w, s0, sv, s2, op_log, elev, h))
-        return walls
+            # 构建重复索引和 wall step 偏移
+            point_indices = np.repeat(np.arange(n_pts, dtype=np.int32), n_wall)
+            wall_offsets = np.concatenate([np.arange(nw, dtype=np.int32) for nw in n_wall])
+
+            chunk = PLYFile.create_array(total)
+            chunk['x'] = x_center[point_indices] + ox[point_indices]
+            chunk['y'] = -(elev[point_indices] + (wall_offsets + 0.5) * vert_step[point_indices])
+            chunk['z'] = y_center[point_indices] + oz[point_indices]
+            chunk['f_dc_0'] = sh_w[0]
+            chunk['f_dc_1'] = sh_w[1]
+            chunk['f_dc_2'] = sh_w[2]
+            chunk['opacity'] = op_log
+            chunk['scale_0'] = s0[point_indices]
+            chunk['scale_1'] = sv[point_indices]
+            chunk['scale_2'] = s2[point_indices]
+            chunk['rot_0'] = 1.0
+            chunk['semantic_class'] = 2.0
+            chunk['ground_height'] = elev[point_indices]
+            chunk['relative_height'] = h[point_indices]
+            all_chunks.append(chunk)
+
+        if not all_chunks:
+            return PLYFile.create_array(0)
+        return np.concatenate(all_chunks)
 
     # ═══════════════════════════════════════════
     # 内部 — 屋顶/地面 (numpy 向量化)
@@ -325,8 +358,8 @@ class SemanticMapBuilder:
         n = len(rr)
 
         # 位置
-        all_lon = self._tf[2] + (cc.astype(np.float32)+0.5)*self._tf[0] + (rr.astype(np.float32)+0.5)*self._tf[1]
-        all_lat = self._tf[5] + (cc.astype(np.float32)+0.5)*self._tf[3] + (rr.astype(np.float32)+0.5)*self._tf[4]
+        all_lon = self._tf[2] + (cc.astype(np.float32) + 0.5) * self._tf[0] + (rr.astype(np.float32) + 0.5) * self._tf[1]
+        all_lat = self._tf[5] + (cc.astype(np.float32) + 0.5) * self._tf[3] + (rr.astype(np.float32) + 0.5) * self._tf[4]
         x_m = (all_lon - self._center_lon) * self._m_deg_lon
         y_m = (all_lat - self._center_lat) * self.M_DEG_LAT
         elev = self._dem[rr, cc]
@@ -346,6 +379,8 @@ class SemanticMapBuilder:
         sh = np.zeros((n, 3), dtype=np.float32)
         for sc_id in range(4):
             mask = sem == sc_id
+            if not np.any(mask):
+                continue
             cr, cg, cb = self.CLASS_COLORS[sc_id]
             dc0, dc1, dc2 = self._rgb_to_sh_dc(cr, cg, cb)
             sh[mask, 0] = dc0
@@ -363,9 +398,9 @@ class SemanticMapBuilder:
         chunk['x'] = vx.astype(np.float32)
         chunk['y'] = vy.astype(np.float32)
         chunk['z'] = vz.astype(np.float32)
-        chunk['f_dc_0'] = sh[:,0]
-        chunk['f_dc_1'] = sh[:,1]
-        chunk['f_dc_2'] = sh[:,2]
+        chunk['f_dc_0'] = sh[:, 0]
+        chunk['f_dc_1'] = sh[:, 1]
+        chunk['f_dc_2'] = sh[:, 2]
         chunk['opacity'] = op_log
         chunk['scale_0'] = s_h
         chunk['scale_1'] = self._sq(sv)
@@ -376,24 +411,6 @@ class SemanticMapBuilder:
         chunk['relative_height'] = np.where(is_bld, bh, 0.0).astype(np.float32)
 
         return chunk
-
-    # ═══════════════════════════════════════════
-    # 内部 — 墙面数据写入
-    # ═══════════════════════════════════════════
-    @staticmethod
-    def _walls_to_array(wall_data):
-        n = len(wall_data)
-        wa = PLYFile.create_array(n)
-        for i, w in enumerate(wall_data):
-            wa[i] = (
-                w[0],w[1],w[2], 0,0,0,
-                w[3],w[4],w[5],
-                *([0.0]*45),
-                w[9], w[6],w[7],w[8],
-                1.0,0.0,0.0,0.0,
-                2.0, w[10],w[11]
-            )
-        return wa
 
     # ═══════════════════════════════════════════
     # 主构建流程
@@ -423,8 +440,8 @@ class SemanticMapBuilder:
 
         # 6. 墙面
         print('Walls (orange)...')
-        wall_data = self._build_walls()
-        nw = len(wall_data)
+        wall_chunk = self._build_walls()
+        nw = len(wall_chunk)
         print(f'  {nw:,} wall gaussians')
 
         # 7. 屋顶/地面
@@ -438,8 +455,7 @@ class SemanticMapBuilder:
             PLYFile.write_header(f, n_total)
             f.write(chunk.tobytes())
             if nw > 0:
-                wa = self._walls_to_array(wall_data)
-                f.write(wa.tobytes())
+                f.write(wall_chunk.tobytes())
 
         mb = os.path.getsize(self.out_path) / 1024 / 1024
         dt = time.time() - t0
@@ -449,7 +465,7 @@ class SemanticMapBuilder:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 独立测试入口
+# 独立测试入口 / CLI
 # ═══════════════════════════════════════════════════════════════
 
 def test(label_path: str = None, dem_path: str = None, out_path: str = None):

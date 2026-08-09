@@ -8,17 +8,12 @@
   main()            — 入口
 """
 
-import argparse
-import math
-import os
-import time
-from pathlib import Path
-
-import numpy as np
-import rasterio
+import numpy as np, rasterio, os, math, time
 from scipy import ndimage
 from scipy.ndimage import binary_erosion
 from plyfile import PlyData
+from classify_vecw import SANHE_LABEL_DIR, SANHE_SATE,SANHE_VEC,\
+VecClassifier
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -91,16 +86,23 @@ class PLYFile:
 class SemanticMapBuilder:
     """
     从 DEM + 语义标签生成标准 3DGS PLY
-
+    
     用法:
+      b = SemanticMapBuilder()
+      b.set_input(label_path='...', dem_path='...')
+      b.build()
+    
+    或直接构造:
       b = SemanticMapBuilder(label_path='...', dem_path='...')
       b.build()
     """
 
-    # 默认 I/O 路径（实例参数，非类级全局）
-    _DEFAULT_LABEL = 'TestInput/SanHe/labels.tif'
-    _DEFAULT_DEM   = 'TestInput/SanHe/dem.tif'
-    _DEFAULT_OUT   = 'TestInput/SanHe/semanticMap.ply'
+    # ═══════════════════════════════════════════
+    # 静态配置 — I/O 路径
+    # ═══════════════════════════════════════════
+    IN_LABEL_FILE  = 'TestInput/SanHe/labels.tif'
+    IN_DEM_FILE = 'TestInput/SanHe/dem.tif'
+    OUT_FILE = 'TestInput/SanHe/semanticMap.ply'
 
     # ═══════════════════════════════════════════
     # 静态配置 — 几何参数
@@ -161,9 +163,9 @@ class SemanticMapBuilder:
     # 实例初始化
     # ═══════════════════════════════════════════
     def __init__(self, label_path=None, dem_path=None, out_path=None):
-        self.label_path = label_path or self._DEFAULT_LABEL
-        self.dem_path   = dem_path   or self._DEFAULT_DEM
-        self.out_path   = out_path   or self._DEFAULT_OUT
+        self.label_path = label_path or self.IN_LABEL_FILE
+        self.dem_path   = dem_path   or self.IN_DEM_FILE
+        self.out_path   = out_path   or self.OUT_FILE
 
         # 运行时数据
         self._class_id   = None
@@ -400,7 +402,7 @@ class SemanticMapBuilder:
     # ═══════════════════════════════════════════
     def build(self):
         t0 = time.time()
-        Path(self.out_path).parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
 
         # 1. 加载
         self._load()
@@ -452,23 +454,13 @@ class SemanticMapBuilder:
 # 独立测试入口
 # ═══════════════════════════════════════════════════════════════
 
-def test(label_path: str = None, dem_path: str = None, out_path: str = None):
+def test():
     """检测 3DGS 生成器输入是否有效，无效则报错，有效则运行。"""
-    builder = SemanticMapBuilder(label_path, dem_path, out_path)
+    builder = SemanticMapBuilder()
     for pth in (builder.label_path, builder.dem_path):
-        if not Path(pth).is_file():
+        if not os.path.isfile(pth):
             raise FileNotFoundError(f"缺少输入: {pth}")
     builder.build()
 
 
-def main():
-    p = argparse.ArgumentParser(description="语义地图 3DGS PLY 生成器")
-    p.add_argument("--label", default="TestInput/SanHe/labels.tif", help="语义标签路径")
-    p.add_argument("--dem", default="TestInput/SanHe/dem.tif", help="DEM 路径")
-    p.add_argument("--out", default="TestInput/SanHe/semanticMap.ply", help="输出 PLY 路径")
-    args = p.parse_args()
-    test(args.label, args.dem, args.out)
-
-
-if __name__ == "__main__":
-    main()
+# 本模块不持有 main 入口，由 gen_adaptive_terrain.py 统一调度。

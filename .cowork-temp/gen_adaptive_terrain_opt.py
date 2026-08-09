@@ -12,6 +12,7 @@ gen_adaptive_terrain.py -- 自适应分辨率 UE 地形生成器
 """
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -228,7 +229,7 @@ class AdaptiveTerrainBuilder:
         print(f"  三角形数: {len(self.tri.simplices):,}, 耗时 {time.time()-t0:.1f}s")
 
     # ═══════════════════════════════════════════════════════════════
-    # 网格生成
+    # 网格生成（核心向量化优化）
     # ═══════════════════════════════════════════════════════════════
 
     def build_mesh(self):
@@ -236,55 +237,58 @@ class AdaptiveTerrainBuilder:
         print("构建三维网格...")
         t0 = time.time()
         H, W = self.H10, self.W10
+        simplices = self.tri.simplices  # (N, 3)
+        N = len(simplices)
 
-        # 第一步：收集每个三角形的重心 class（向量化）
-        simplices = self.tri.simplices
-        pts_tri = self.pts[simplices]
-        centroids = pts_tri.mean(axis=1)
+        # 第一步：收集每个三角形的重心 class（NumPy 向量化）
+        pts_tri = self.pts[simplices]  # (N, 3, 2)
+        centroids = pts_tri.mean(axis=1)  # (N, 2)
         cr_i = np.clip(np.round(centroids[:, 0]).astype(np.int64), 0, H - 1)
         cc_i = np.clip(np.round(centroids[:, 1]).astype(np.int64), 0, W - 1)
-        tri_cls_arr = self.class_10x[cr_i, cc_i]
-        tri_classes = [(int(s[0]), int(s[1]), int(s[2]), int(c))
-                       for s, c in zip(simplices, tri_cls_arr)]
+        tri_classes = self.class_10x[cr_i, cc_i]  # (N,)
 
-        # 第二步：找出建筑裙边三角形和建筑边界顶点
-        edge_count = {}
-        for i0, i1, i2, cls_center in tri_classes:
-            if cls_center != 40:
-                continue
-            for k in range(3):
-                k1 = (k + 1) % 3
-                idx = (i0, i1, i2)
-                edge = tuple(sorted((idx[k], idx[k1])))
-                edge_count[edge] = edge_count.get(edge, 0) + 1
+        # 第二步：找出建筑裙边三角形和建筑边界顶点（向量化）
+        edges = np.concatenate([
+            np.sort(simplices[:, [0, 1]], axis=1),
+            np.sort(simplices[:, [1, 2]], axis=1),
+            np.sort(simplices[:, [2, 0]], axis=1),
+        ], axis=0)
+        tri_idx = np.repeat(np.arange(N), 3)
+
+        building_tri_mask = tri_classes == 40
+        building_edge_mask = np.repeat(building_tri_mask, 3)
+        building_edges = edges[building_edge_mask]
 
         building_boundary_vertices = set()
-        skirt_face_flags = []
-        for i0, i1, i2, cls_center in tri_classes:
-            if cls_center != 40:
-                skirt_face_flags.append(False)
-                continue
-            is_skirt = False
-            for k in range(3):
-                k1 = (k + 1) % 3
-                idx = (i0, i1, i2)
-                edge = tuple(sorted((idx[k], idx[k1])))
-                if edge_count.get(edge, 0) == 1:
-                    is_skirt = True
-                    building_boundary_vertices.add(idx[k])
-                    building_boundary_vertices.add(idx[k1])
-            skirt_face_flags.append(is_skirt)
+        skirt_face_flags = np.zeros(N, dtype=bool)
+        if len(building_edges) > 0:
+            be_view = building_edges.copy().view(np.dtype((np.void, building_edges.dtype.itemsize * 2))).ravel()
+            _, inv, counts = np.unique(be_view, return_inverse=True, return_counts=True)
+            boundary_edge_mask = counts[inv] == 1
+            boundary_edges = building_edges[boundary_edge_mask]
+            if len(boundary_edges) > 0:
+                building_boundary_vertices = set(np.unique(boundary_edges.ravel()))
 
-        # 第三步：根据裙边最大距离计算建筑下沉深度图（边界处 depth=0，裙边深处 depth=1cm）
+                # 向量化：找到包含边界边的三角形
+                all_edges_sorted = np.sort(edges, axis=1)
+                dt = np.dtype((np.void, all_edges_sorted.dtype.itemsize * 2))
+                all_edges_view = all_edges_sorted.copy().view(dt).ravel()
+                boundary_edges_view = boundary_edges.copy().view(dt).ravel()
+                is_boundary_edge = np.isin(all_edges_view, boundary_edges_view)
+                boundary_tri_indices = tri_idx[is_boundary_edge]
+                if len(boundary_tri_indices) > 0:
+                    tri_has_boundary_edge = np.zeros(N, dtype=bool)
+                    tri_has_boundary_edge[np.unique(boundary_tri_indices)] = True
+                    skirt_face_flags = building_tri_mask & tri_has_boundary_edge
+
+        # 第三步：根据裙边最大距离计算建筑下沉深度图
         skirt_max_dist = 0.0
-        for (i0, i1, i2, cls_center), is_skirt in zip(tri_classes, skirt_face_flags):
-            if cls_center != 40 or not is_skirt:
-                continue
-            for idx in (i0, i1, i2):
-                r, c = int(round(self.pts[idx][0])), int(round(self.pts[idx][1]))
-                r = np.clip(r, 0, H - 1)
-                c = np.clip(c, 0, W - 1)
-                skirt_max_dist = max(skirt_max_dist, self.building_dist_m[r, c])
+        if np.any(skirt_face_flags):
+            skirt_tris = simplices[skirt_face_flags]
+            skirt_vert_indices = np.unique(skirt_tris.ravel())
+            skirt_r = np.clip(np.round(self.pts[skirt_vert_indices, 0]).astype(np.int64), 0, H - 1)
+            skirt_c = np.clip(np.round(self.pts[skirt_vert_indices, 1]).astype(np.int64), 0, W - 1)
+            skirt_max_dist = self.building_dist_m[skirt_r, skirt_c].max()
 
         if skirt_max_dist > 1e-6:
             t = np.clip(self.building_dist_m / skirt_max_dist, 0.0, 1.0)
@@ -302,68 +306,82 @@ class AdaptiveTerrainBuilder:
         y += (H / SCALE) * PX_M * self.ue_scale * 0.5
         cls = self.class_10x[r, c]
         dem_h = self.dem_10x[r, c].copy()
-        water_m = cls == 0
-        bld_m = cls == 40
-        if np.any(water_m):
-            dem_h[water_m] -= self.water_depth_map[r[water_m], c[water_m]]
-        if np.any(bld_m):
-            dem_h[bld_m] -= self.building_depth_map[r[bld_m], c[bld_m]]
+        water_mask_pts = cls == 0
+        bld_mask_pts = cls == 40
+        if np.any(water_mask_pts):
+            dem_h[water_mask_pts] -= self.water_depth_map[r[water_mask_pts], c[water_mask_pts]]
+        if np.any(bld_mask_pts):
+            dem_h[bld_mask_pts] -= self.building_depth_map[r[bld_mask_pts], c[bld_mask_pts]]
         z = dem_h * self.ue_scale
         u = c / (W - 1)
         v = r / (H - 1)
         self.verts = list(zip(x, y, z, u, v))
+        verts_arr = np.array(self.verts, dtype=np.float64)
 
-        # 统一朝向（向量化）
+        # 第五步：统一朝向（向量化）
         p0 = self.pts[simplices[:, 0]]
         p1 = self.pts[simplices[:, 1]]
         p2 = self.pts[simplices[:, 2]]
         cross = (p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) - (p1[:, 1] - p0[:, 1]) * (p2[:, 0] - p0[:, 0])
         needs_swap = cross < 0
-        swapped = simplices.copy()
-        swapped[needs_swap, 0], swapped[needs_swap, 1] = swapped[needs_swap, 1], swapped[needs_swap, 0]
+        i0 = simplices[:, 0].copy()
+        i1 = simplices[:, 1].copy()
+        i2 = simplices[:, 2].copy()
+        i0[needs_swap], i1[needs_swap] = i1[needs_swap], i0[needs_swap]
 
-        # 第五步：分配面到对应 OBJ（逻辑密集，保留循环）
-        for tri_idx, ((i0, i1, i2, cls_center), is_skirt) in enumerate(zip(tri_classes, skirt_face_flags)):
-            s0, s1, s2 = swapped[tri_idx]
+        # 第六步：分配面到对应 OBJ
+        water_mask = tri_classes == 0
+        building_mask = tri_classes == 40
+        ground_mask = (tri_classes != 40) | skirt_face_flags
 
-            if cls_center == 0:
-                # 水体：地面 OBJ 中凹包用深色泥沙
-                self.ground_faces.append((s0, s1, s2, MAT_WATER_BED))
-                # 生成蓝色水面盖子
-                water_vis = []
-                for idx in (s0, s1, s2):
-                    x, y, _, u, v = self.verts[idx]
-                    pr, pc = int(round(self.pts[idx][0])), int(round(self.pts[idx][1]))
-                    pr = np.clip(pr, 0, H - 1)
-                    pc = np.clip(pc, 0, W - 1)
-                    z = self.dem_10x[pr, pc] * self.ue_scale
-                    self.water_verts.append((x, y, z, u, v))
-                    water_vis.append(len(self.water_verts) - 1)
-                self.water_faces.append((water_vis[0], water_vis[1], water_vis[2], MAT_WATER))
-            elif cls_center == 40:
-                # 建筑 OBJ 包含整个建筑区域
-                building_vis = []
-                for idx in (s0, s1, s2):
-                    x, y, _, u, v = self.verts[idx]
-                    if idx in building_boundary_vertices:
-                        # 边界顶点：与地面 OBJ 同高，确保严丝合缝
-                        z = self.verts[idx][2]
-                    else:
-                        # 内部顶点：原始 DEM 高度，覆盖地面 OBJ
-                        pr, pc = int(round(self.pts[idx][0])), int(round(self.pts[idx][1]))
-                        pr = np.clip(pr, 0, H - 1)
-                        pc = np.clip(pc, 0, W - 1)
-                        z = self.dem_10x[pr, pc] * self.ue_scale
-                    self.building_verts.append((x, y, z, u, v))
-                    building_vis.append(len(self.building_verts) - 1)
-                self.building_faces.append((building_vis[0], building_vis[1], building_vis[2], MAT_BUILDING))
+        bd_set = building_boundary_vertices
 
-                # 裙边三角形同时留在地面 OBJ，用建筑纹理
-                if is_skirt:
-                    self.ground_faces.append((s0, s1, s2, MAT_BUILDING_GROUND))
-            else:
-                mat = class_to_mat(cls_center)
-                self.ground_faces.append((s0, s1, s2, mat))
+        # --- 水面 OBJ ---
+        if np.any(water_mask):
+            water_tris = np.column_stack([i0[water_mask], i1[water_mask], i2[water_mask]])
+            water_vert_idx = water_tris.ravel()
+            water_xyuv = verts_arr[water_vert_idx][:, [0, 1, 3, 4]]
+            water_r = np.clip(np.round(self.pts[water_vert_idx, 0]).astype(np.int64), 0, H - 1)
+            water_c = np.clip(np.round(self.pts[water_vert_idx, 1]).astype(np.int64), 0, W - 1)
+            water_z = self.dem_10x[water_r, water_c] * self.ue_scale
+            water_verts_arr = np.column_stack([water_xyuv[:, 0], water_xyuv[:, 1], water_z, water_xyuv[:, 2], water_xyuv[:, 3]])
+            self.water_verts = [tuple(v) for v in water_verts_arr]
+            water_faces_idx = np.arange(len(water_vert_idx)).reshape(-1, 3)
+            self.water_faces = [(int(a), int(b), int(c), MAT_WATER) for a, b, c in water_faces_idx]
+        else:
+            self.water_verts = []
+            self.water_faces = []
+
+        # --- 建筑 OBJ ---
+        if np.any(building_mask):
+            building_tris = np.column_stack([i0[building_mask], i1[building_mask], i2[building_mask]])
+            building_vert_idx = building_tris.ravel()
+            is_bd = np.isin(building_vert_idx, list(bd_set))
+            building_xyuv = verts_arr[building_vert_idx][:, [0, 1, 3, 4]]
+            building_r = np.clip(np.round(self.pts[building_vert_idx, 0]).astype(np.int64), 0, H - 1)
+            building_c = np.clip(np.round(self.pts[building_vert_idx, 1]).astype(np.int64), 0, W - 1)
+            building_z = self.dem_10x[building_r, building_c] * self.ue_scale
+            if np.any(is_bd):
+                building_z[is_bd] = verts_arr[building_vert_idx[is_bd], 2]
+            building_verts_arr = np.column_stack([building_xyuv[:, 0], building_xyuv[:, 1], building_z, building_xyuv[:, 2], building_xyuv[:, 3]])
+            self.building_verts = [tuple(v) for v in building_verts_arr]
+            building_faces_idx = np.arange(len(building_vert_idx)).reshape(-1, 3)
+            self.building_faces = [(int(a), int(b), int(c), MAT_BUILDING) for a, b, c in building_faces_idx]
+        else:
+            self.building_verts = []
+            self.building_faces = []
+
+        # --- 地面 OBJ ---
+        if np.any(ground_mask):
+            ground_tri_indices = np.where(ground_mask)[0]
+            ground_tris = np.column_stack([i0[ground_tri_indices], i1[ground_tri_indices], i2[ground_tri_indices]])
+            ground_classes = tri_classes[ground_tri_indices]
+            ground_mats = class_to_mat(ground_classes)
+            # 裙边三角形覆盖为建筑材质
+            ground_mats[skirt_face_flags[ground_tri_indices]] = MAT_BUILDING_GROUND
+            self.ground_faces = [(int(a), int(b), int(c), int(m)) for a, b, c, m in zip(ground_tris[:, 0], ground_tris[:, 1], ground_tris[:, 2], ground_mats)]
+        else:
+            self.ground_faces = []
 
         print(f"  地面顶点: {len(self.verts):,}, 地面三角形: {len(self.ground_faces):,}")
         print(f"  水面顶点: {len(self.water_verts):,}, 水面三角形: {len(self.water_faces):,}")
@@ -371,7 +389,7 @@ class AdaptiveTerrainBuilder:
         print(f"  耗时 {time.time()-t0:.1f}s")
 
     # ═══════════════════════════════════════════════════════════════
-    # 法线与导出
+    # 法线与导出（向量化优化）
     # ═══════════════════════════════════════════════════════════════
 
     @staticmethod
@@ -484,9 +502,9 @@ def main():
 
     label_dir = Path(args.label_dir)
     label_path = str(label_dir / "labels.tif")
-    out_10x = str(label_dir / "Output_10x")
-    label_10x_path = str(label_dir / "Output_10x" / "labels_10x_no_boundary.tif")
-    boundary_path = str(label_dir / "Output_10x" / "boundary_lines_10x.png")
+    out_10x = label_dir / "Output_10x"
+    label_10x_path = str(out_10x / "labels_10x_no_boundary.tif")
+    boundary_path = str(out_10x / "boundary_lines_10x.png")
     semantic_ply = str(label_dir / "semanticMap.ply")
 
     vec_path = str(label_dir / "vec_raw.png")
@@ -511,7 +529,7 @@ def main():
         print("=" * 60)
         print("Stage 2/4: 标签后处理")
         print("=" * 60)
-        pp = LabelPostprocessor(input_path=label_path, output_dir=out_10x)
+        pp = LabelPostprocessor(input_path=label_path, output_dir=str(out_10x))
         pp.process()
 
     # 3. 简化 3DGS 语义地图

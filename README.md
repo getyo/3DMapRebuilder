@@ -38,7 +38,7 @@
   ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ Stage 1: 语义分类                                            │
-│ classify_vecw.py :: VecClassifier + test()                   │
+│ classify_vecw.py :: VecClassifier + main()                   │
 │ 从 vec_raw.png 的 RGBA 颜色分类语义标签                       │
 │ 输出: water.tif, building.tif, road.tif, labels.tif         │
 └─────────────────────────────────────────────────────────────┘
@@ -46,24 +46,24 @@
   ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ Stage 2: 标签后处理                                          │
-│ label_postprocess.py :: LabelPostprocessor + test()          │
+│ label_postprocess.py :: LabelPostprocessor + main()          │
 │ 对 labels.tif 做 10x 上采样、轮廓平滑、边界提取              │
 │ 输出: labels_10x_no_boundary.tif, boundary_lines_10x.png    │
 └─────────────────────────────────────────────────────────────┘
   │
   ├───▶┌─────────────────────────────────────────────────────┐
   │    │ Stage 3: 简化 3DGS 语义地图                          │
-  │    │ gen_semantic.py :: SemanticMapBuilder + test()       │
+  │    │ gen_semantic.py :: SemanticMapBuilder + main()       │
   │    │ 从 labels.tif + dem 生成 3DGS 语义点云 PLY           │
   │    │ 输出: semanticMap.ply                                │
   │    └─────────────────────────────────────────────────────┘
   │
   ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Stage 4: 自适应地形 OBJ（唯一 main 入口）                    │
+│ Stage 4: 自适应地形 OBJ（推荐入口）                          │
 │ gen_adaptive_terrain.py :: AdaptiveTerrainBuilder + main()   │
 │ 从 10x 标签 + 边界线 + DEM 生成 UE 可用 OBJ                  │
-│ 输出: terrain_adaptive.obj, terrain_adaptive.mtl            │
+│ 输出: terrain_ground.obj, terrain_water.obj, terrain_building.obj │
 └─────────────────────────────────────────────────────────────┘
   │
   ▼
@@ -80,7 +80,7 @@
 | **VecClassifier** | 语义分类器 | `vec_raw.png`, `satellite.tif` | `water.tif`, `building.tif`, `road.tif`, `labels.tif` |
 | **LabelPostprocessor** | 标签后处理器 | `labels.tif` | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `preview_classification_noboundary.png` |
 | **SemanticMapBuilder** | 3DGS 点云生成器 | `labels.tif`, `dem.tif` | `semanticMap.ply` |
-| **AdaptiveTerrainBuilder** | 自适应地形生成器 | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `dem.tif` | `terrain_adaptive.obj`, `terrain_adaptive.mtl` |
+| **AdaptiveTerrainBuilder** | 自适应地形生成器 | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `dem.tif` | `terrain_ground.obj`, `terrain_water.obj`, `terrain_building.obj` |
 
 ## 五、使用说明
 
@@ -91,9 +91,9 @@ python gen_adaptive_terrain.py
 ```
 
 会依次执行：
-1. `classify_vecw.test()` 语义分类
-2. `label_postprocess.test()` 标签后处理
-3. `gen_semantic.test()` 简化 3DGS 语义地图
+1. `classify_vecw` 语义分类
+2. `label_postprocess` 标签后处理
+3. `gen_semantic` 简化 3DGS 语义地图
 4. `AdaptiveTerrainBuilder.build()` 自适应地形 OBJ
 
 ### 5.2 强制重新生成所有中间文件
@@ -104,29 +104,36 @@ python gen_adaptive_terrain.py --force
 
 默认情况下会利用已有中间文件，只有缺失或指定 `--force` 时才重新生成。
 
-### 5.3 单独测试各模块
+### 5.3 单独运行各模块
 
-每个模块提供一个独立的 `test()` 函数，用于检测自身输入并运行：
+四个模块均可独立运行，均提供命令行入口，支持通过参数覆盖默认路径：
 
-```python
-# 单独跑语义分类
-from classify_vecw import test
-test()
+```bash
+# 语义分类
+python classify_vecw.py --vec TestInput/SanHe/vec_raw.png --sate TestInput/SanHe/satellite.tif --out TestInput/SanHe
 
-# 单独跑标签后处理
-from label_postprocess import test
-test()
+# 标签后处理
+python label_postprocess.py --input TestInput/SanHe/labels.tif --out-dir TestInput/SanHe/Output_10x
 
-# 单独跑 3DGS 语义地图
-from gen_semantic import test
-test()
+# 3DGS 语义地图
+python gen_semantic.py --label TestInput/SanHe/labels.tif --dem TestInput/SanHe/dem.tif --out TestInput/SanHe/semanticMap.ply
 
-# 单独跑完整地形管线
-from gen_adaptive_terrain import test
-test()
+# 自适应地形（完整管线）
+python gen_adaptive_terrain.py --label-dir TestInput/SanHe --dem TestInput/SanHe/dem.tif --out-dir output/terrain_adaptive
 ```
 
-> 注意：`classify_vecw.test()`、`label_postprocess.test()`、`gen_semantic.test()` 均使用默认路径，仅检查自身输入是否存在，不存在则报错。
+也可通过 `test()` 函数以编程方式调用：
+
+```python
+from classify_vecw import test
+test(vec_path='...', sate_path='...', out_dir='...')
+
+from label_postprocess import test
+test(input_path='...', output_dir='...')
+
+from gen_semantic import test
+test(label_path='...', dem_path='...', out_path='...')
+```
 
 ### 5.4 命令行参数
 
@@ -146,7 +153,7 @@ python gen_adaptive_terrain.py --help
 
 ### 6.1 VecClassifier
 
-`classify_vecw.py` 中的单例类，将天地图矢量底图按颜色分类。
+`classify_vecw.py` 中的类，将天地图矢量底图按颜色分类。
 
 **输出格式（labels.tif 三通道）**：
 
@@ -158,15 +165,15 @@ python gen_adaptive_terrain.py --help
 
 ### 6.2 LabelPostprocessor
 
-`label_postprocess.py` 中的非单例类，对 `labels.tif` 做 10x 上采样与轮廓平滑。
+`label_postprocess.py` 中的类，对 `labels.tif` 做 10x 上采样与轮廓平滑。
 
 ### 6.3 SemanticMapBuilder
 
-`gen_semantic.py` 中的单例类，从语义标签 + DEM 生成 3DGS PLY 点云。
+`gen_semantic.py` 中的类，从语义标签 + DEM 生成 3DGS PLY 点云。
 
 ### 6.4 AdaptiveTerrainBuilder
 
-`gen_adaptive_terrain.py` 中的非单例类，从 10x 标签 + 边界线 + DEM 生成 UE 可用的自适应分辨率地形 OBJ。
+`gen_adaptive_terrain.py` 中的类，从 10x 标签 + 边界线 + DEM 生成 UE 可用的自适应分辨率地形 OBJ。
 
 **核心策略**：
 - 粗网格 stride = 10 原始像素（100 10x 像素）。
@@ -175,6 +182,11 @@ python gen_adaptive_terrain.py --help
 - 每个三角形取重心位置的 10x class_id，分配到 `M_Ground` / `M_Road` / `M_Building` / `M_Water` 四个 UE 材质槽。
 - 水体通过 `distance_transform_edt` 生成凹包盆地，保留水边过渡。
 - 坐标系为 UE 左手系 Z-up：`X=east, Y=-north, Z=height`。
+
+**设计特点**：
+
+- 纯数值运算（重心计算、顶点生成、法线计算等）采用 NumPy 向量化实现，保留逻辑密集环节（裙边检测、面分配）的显式循环以确保可维护性。
+- OBJ 导出采用批量字符串拼接，减少小写入开销。
 
 ## 七、输入文件
 
@@ -196,8 +208,12 @@ python gen_adaptive_terrain.py --help
 - `TestInput/SanHe/Output_10x/labels_10x_no_boundary.tif` — 10x 上采样语义标签
 - `TestInput/SanHe/Output_10x/boundary_lines_10x.png` — 独立轮廓线图
 - `TestInput/SanHe/Output_10x/preview_classification_noboundary.png` — 分类预览图
-- `output/terrain_adaptive/terrain_adaptive.obj` — UE 自适应地形网格
-- `output/terrain_adaptive/terrain_adaptive.mtl` — UE 地形材质定义
+- `output/terrain_adaptive/terrain_ground.obj` — 地面/道路/水体凹包 + 建筑裙边
+- `output/terrain_adaptive/terrain_ground.mtl` — 地面材质定义
+- `output/terrain_adaptive/terrain_water.obj` — 蓝色水面盖子
+- `output/terrain_adaptive/terrain_water.mtl` — 水面材质定义
+- `output/terrain_adaptive/terrain_building.obj` — 建筑核心区域顶面
+- `output/terrain_adaptive/terrain_building.mtl` — 建筑材质定义
 
 ## 九、待办
 

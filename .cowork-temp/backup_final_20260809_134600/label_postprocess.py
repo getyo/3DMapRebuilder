@@ -9,9 +9,7 @@
   preview_classification_noboundary.png — 可视化预览
 """
 
-import argparse
-from pathlib import Path
-
+import os
 import cv2
 import numpy as np
 import scipy.ndimage
@@ -21,6 +19,9 @@ try:
     HAS_RASTERIO = True
 except ImportError:
     HAS_RASTERIO = False
+
+from classify_vecw import VecClassifier, SANHE_VEC, SANHE_SATE, SANHE_LABEL_DIR
+from gen_semantic import SemanticMapBuilder
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -82,7 +83,7 @@ class LabelPostprocessor:
 
     def process(self):
         """执行完整后处理流程"""
-        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
 
         self._load_input()
         self._upsample()
@@ -217,13 +218,12 @@ class LabelPostprocessor:
 
         out_labels = np.stack([self._out_band1, self._out_band2, self._out_band3], axis=0)
 
-        out_dir = Path(self.output_dir)
-        path_labels_tif = out_dir / "labels_10x_no_boundary.tif"
-        path_boundary_png = out_dir / "boundary_lines_10x.png"
-        path_vis_png = out_dir / "preview_classification_noboundary.png"
+        path_labels_tif = os.path.join(self.output_dir, "labels_10x_no_boundary.tif")
+        path_boundary_png = os.path.join(self.output_dir, "boundary_lines_10x.png")
+        path_vis_png = os.path.join(self.output_dir, "preview_classification_noboundary.png")
 
-        cv2.imwrite(str(path_boundary_png), self._boundary)
-        cv2.imwrite(str(path_vis_png), cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(path_boundary_png, self._boundary)
+        cv2.imwrite(path_vis_png, cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR))
 
         if HAS_RASTERIO and self._profile is not None:
             self._profile.update(
@@ -233,7 +233,7 @@ class LabelPostprocessor:
                 height=self._H_10x,
                 transform=self._profile['transform'] * self._profile['transform'].scale(0.1, 0.1)
             )
-            with rasterio.open(str(path_labels_tif), 'w', **self._profile) as dst:
+            with rasterio.open(path_labels_tif, 'w', **self._profile) as dst:
                 dst.write(out_labels)
             print(f"[OK] 10x GeoTIFF 已保存: {path_labels_tif}")
 
@@ -353,21 +353,12 @@ class LabelPostprocessor:
 # 独立测试入口
 # ═══════════════════════════════════════════════════════════════
 
-def test(input_path: str = None, output_dir: str = None):
+def test():
     """检测标签后处理器输入是否有效，无效则报错，有效则运行。"""
-    pp = LabelPostprocessor(input_path, output_dir)
-    if not Path(pp.input_path).is_file():
+    pp = LabelPostprocessor()
+    if not os.path.isfile(pp.input_path):
         raise FileNotFoundError(f"缺少输入: {pp.input_path}")
     pp.process()
 
 
-def main():
-    p = argparse.ArgumentParser(description="语义标签后处理器（10x 上采样 + 轮廓平滑）")
-    p.add_argument("--input", default="TestInput/SanHe/labels.tif", help="输入 labels.tif 路径")
-    p.add_argument("--out-dir", default="TestInput/SanHe/Output_10x", help="输出目录")
-    args = p.parse_args()
-    test(args.input, args.out_dir)
-
-
-if __name__ == "__main__":
-    main()
+# 本模块不持有 main 入口，由 gen_adaptive_terrain.py 统一调度。

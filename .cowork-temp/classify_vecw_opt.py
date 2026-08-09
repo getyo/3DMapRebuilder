@@ -20,7 +20,8 @@ from PIL import Image
 import rasterio
 from scipy.ndimage import binary_closing
 
-# ============ 1. RGBA 颜色常量 ============
+
+# ============ RGBA 颜色常量 ============
 class RGBA(NamedTuple):
     """不可变 RGBA 颜色值"""
     R: int
@@ -28,8 +29,6 @@ class RGBA(NamedTuple):
     B: int
     A: int = 255
 
-# ============ 2. 输出配置 ============
-SANHE_LABEL_DIR = "TestInput/SanHe"
 
 # 精确标签颜色（基于用户提供的纯色样本）
 COLOR_WATER    = RGBA(171, 198, 239)  # 水体
@@ -46,6 +45,7 @@ COLOR_PATH        = RGBA(253, 253, 253)  # 小路  G=200
 # RGB容差
 RGB_DIFF = 0
 
+
 def _match_rgba(r, g, b, color: RGBA, opaque):
     """像素 (R,G,B) 是否匹配给定颜色(±1 容差)，且不透明"""
     return opaque & \
@@ -54,7 +54,7 @@ def _match_rgba(r, g, b, color: RGBA, opaque):
         (b >= color.B - RGB_DIFF) & (b <= color.B + RGB_DIFF)
 
 
-# ============ 3. 分类器 ============
+# ============ 分类器 ============
 class VecClassifier:
     """Vec 瓦片语义分类器（普通类，非单例）"""
 
@@ -252,7 +252,7 @@ class VecClassifier:
         print(f"  Saved {Path(self.label_out).name}")
 
 
-# ============ 5. 独立测试入口 / CLI ============
+# ============ 独立测试入口 / CLI ============
 
 def test(vec_path: str = None, sat_path: str = None, out_dir: str = None):
     """检测分类器输入是否有效，无效则报错，有效则运行。"""

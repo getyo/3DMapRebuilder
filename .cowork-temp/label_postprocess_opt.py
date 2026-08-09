@@ -24,7 +24,7 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 标签后处理器（非单例）
+# 标签后处理器（普通类）
 # ═══════════════════════════════════════════════════════════════
 
 class LabelPostprocessor:
@@ -37,10 +37,9 @@ class LabelPostprocessor:
 
     或链式设置:
       pp = LabelPostprocessor()
-      pp.set_input(classifier.label_out).set_output('...').process()
+      pp.set_input('...').set_output('...').process()
     """
 
-    # 默认路径与分类器输出保持一致
     DEFAULT_INPUT  = "TestInput/SanHe/labels.tif"
     DEFAULT_OUTPUT = "TestInput/SanHe/Output_10x"
     SCALE          = 10
@@ -196,24 +195,25 @@ class LabelPostprocessor:
         self._out_band3[self._out_band1 == 40] = 120  # 建筑高度
 
     def _visualize_and_save(self):
-        """可视化预览并保存所有输出"""
+        """可视化预览并保存所有输出（道路颜色已 NumPy 向量化）"""
         print("正在生成分类预览图...")
         vis_rgb = np.zeros((self._H_10x, self._W_10x, 3), dtype=np.uint8)
         vis_rgb[self._out_band1 == 60] = [30, 0, 50]       # 地面: 深红棕
         vis_rgb[self._out_band1 == 40] = [120, 10, 80]     # 建筑: 紫蓝色
         vis_rgb[self._out_band1 == 0]  = [0, 0, 0]         # 水体: 黑色
 
-        road_pixels = np.where(self._out_band1 == 20)
-        for r, c in zip(road_pixels[0], road_pixels[1]):
-            lvl = self._out_band2[r, c]
-            if lvl == 40:      # 高速
-                vis_rgb[r, c] = [241, 160, 186]
-            elif lvl == 80:    # 国道
-                vis_rgb[r, c] = [120, 205, 254]
-            elif lvl == 120:   # 省道
-                vis_rgb[r, c] = [130, 235, 254]
-            else:              # 支路/普通路
-                vis_rgb[r, c] = [0, 230, 50]
+        # 道路颜色 —— NumPy 向量化（消灭大规模 Python 循环）
+        road_mask = self._out_band1 == 20
+        if np.any(road_mask):
+            lvl = self._out_band2[road_mask]
+            road_vis = vis_rgb[road_mask]
+            road_vis[lvl == 40]  = [241, 160, 186]   # 高速
+            road_vis[lvl == 80]  = [120, 205, 254]   # 国道
+            road_vis[lvl == 120] = [130, 235, 254]   # 省道
+            # 其余为支路/普通路
+            other = ~((lvl == 40) | (lvl == 80) | (lvl == 120))
+            road_vis[other] = [0, 230, 50]
+            vis_rgb[road_mask] = road_vis
 
         out_labels = np.stack([self._out_band1, self._out_band2, self._out_band3], axis=0)
 
@@ -233,7 +233,7 @@ class LabelPostprocessor:
                 height=self._H_10x,
                 transform=self._profile['transform'] * self._profile['transform'].scale(0.1, 0.1)
             )
-            with rasterio.open(str(path_labels_tif), 'w', **self._profile) as dst:
+            with rasterio.open(path_labels_tif, 'w', **self._profile) as dst:
                 dst.write(out_labels)
             print(f"[OK] 10x GeoTIFF 已保存: {path_labels_tif}")
 
@@ -350,7 +350,7 @@ class LabelPostprocessor:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 独立测试入口
+# 独立测试入口 / CLI
 # ═══════════════════════════════════════════════════════════════
 
 def test(input_path: str = None, output_dir: str = None):
