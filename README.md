@@ -64,6 +64,7 @@
 │ gen_adaptive_terrain.py :: AdaptiveTerrainBuilder + main()   │
 │ 从 10x 标签 + 边界线 + DEM 生成 UE 可用 OBJ                  │
 │ 输出: terrain_ground.obj, terrain_water.obj, terrain_building.obj │
+│       terrain_water_centerline.csv, terrain_water_centerline_preview.png │
 └─────────────────────────────────────────────────────────────┘
   │
   ▼
@@ -80,7 +81,7 @@
 | **VecClassifier** | 语义分类器 | `vec_raw.png`, `satellite.tif` | `water.tif`, `building.tif`, `road.tif`, `labels.tif` |
 | **LabelPostprocessor** | 标签后处理器 | `labels.tif` | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `preview_classification_noboundary.png` |
 | **SemanticMapBuilder** | 3DGS 点云生成器 | `labels.tif`, `dem.tif` | `semanticMap.ply` |
-| **AdaptiveTerrainBuilder** | 自适应地形生成器 | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `dem.tif` | `terrain_ground.obj`, `terrain_water.obj`, `terrain_building.obj` |
+| **AdaptiveTerrainBuilder** | 自适应地形生成器 | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `dem.tif` | `terrain_ground.obj`, `terrain_water.obj`, `terrain_building.obj`, `terrain_water_centerline.csv`, `terrain_water_centerline_preview.png` |
 
 ## 五、使用说明
 
@@ -175,6 +176,10 @@ python gen_adaptive_terrain.py --help
 
 `gen_adaptive_terrain.py` 中的类，从 10x 标签 + 边界线 + DEM 生成 UE 可用的自适应分辨率地形 OBJ。
 
+**新增能力**：
+- 从水体掩膜提取河流中心线，输出 CSV 供 UE DataTable 导入，支持水体扩散/流动系统的后续开发。
+- 调用 `velocity_field.py` 生成静态速度场纹理，作为后续 UE 材质/Niagara 的流动方向输入。
+
 **核心策略**：
 - 粗网格 stride = 10 原始像素（100 10x 像素）。
 - 从 `boundary_lines_10x.png` 细化出 1 像素宽 10x 边界线。
@@ -214,10 +219,53 @@ python gen_adaptive_terrain.py --help
 - `output/terrain_adaptive/terrain_water.mtl` — 水面材质定义
 - `output/terrain_adaptive/terrain_building.obj` — 建筑核心区域顶面
 - `output/terrain_adaptive/terrain_building.mtl` — 建筑材质定义
+- `output/terrain_adaptive/terrain_water_centerline.csv` — 河流中心线点序列（UE DataTable 格式）
+- `output/terrain_adaptive/terrain_water_centerline_preview.png` — 水体掩膜 + 红色中心线预览
+- `output/terrain_adaptive/terrain_velocity_field.png` — 水体静态速度场纹理（RG=方向，B=有效掩膜）
+- `output/terrain_adaptive/terrain_velocity_field_preview.png` — 速度场流向可视化预览
 
-## 九、待办
+## 九、水体扩散实现管线
+
+本章节说明当前已接入的水体扩散相关流程，以及后续与 UE 对接的步骤。
+
+```
+Python 端
+  │
+  ├── 输入：天地图矢量图 → classify_vecw.py → labels.tif
+  │
+  ├── label_postprocess.py → labels_10x_no_boundary.tif（10x 水体掩膜）
+  │
+  └── gen_adaptive_terrain.py
+        │
+        ├── 生成 terrain_water.obj（水面网格，供 UE 渲染）
+        ├── 生成 terrain_water_centerline.csv（河流中心线，UE DataTable 导入）
+        ├── 生成 terrain_water_centerline_preview.png（人工校验）
+        └── 调用 velocity_field.py 生成 terrain_velocity_field.png（静态速度场）
+
+UE 端
+  │
+  ├── 导入 terrain_water.obj 为 Static Mesh
+  │
+  ├── 创建蓝图结构体 FCenterlinePoint（x, y, z）
+  │
+  ├── 导入 CSV 为 DataTable（Row Type = FCenterlinePoint）
+  │
+  ├── 在 BP_RiverWater 蓝图中：
+  │     For Each Loop 读取 DataTable → Break FCenterlinePoint
+  │     → Make Vector → Add Spline Point
+  │     生成沿河流中心的 Spline
+  │
+  ├── 扩散 RT 模拟：
+  │     扩散 Grid 的每个格子通过世界坐标/水体 UV 采样速度场 Texture，
+  │     用速度方向做 Semi-Lagrangian Advection，实现污染物随水流扩散。
+  │
+  └── 如需动态/更复杂河岸插值，可在 UE 中按 Spline 实时生成速度场 RT 替代静态纹理。
+```
+
+## 十、待办
 
 - [ ] Stage 5：UE 语义层（材质系统、语义查询、区域过滤、交互编辑）
+- [ ] 水体污染扩散 Grid2D 与 UE 材质联动
 - [ ] 完整版 3DGS：从卫星图直出完整 3DGS 渲染点云（需补充三维信息输入）
 - [ ] labels.tif 第三通道补入真实建筑高度（GBA 或阴影法）
 - [ ] 多测试区域支持
