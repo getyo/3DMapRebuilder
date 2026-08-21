@@ -116,6 +116,11 @@ class AdaptiveTerrainBuilder:
         self.building_buffer_depth = building_buffer_depth
         self.ue_scale = ue_scale
         self.velocity_res = 2048
+        self.velocity_seed = 42
+        self.velocity_noise_scale = 0.15
+        self.velocity_bank_weight = 0.35
+        self.velocity_bank_falloff = 8.0
+        self.velocity_profile_power = 1.5
 
         self.H10 = self.W10 = 0
         self.class_10x = None
@@ -463,10 +468,14 @@ class AdaptiveTerrainBuilder:
         c_sampled = np.interp(sample_arc, arc, c_smooth)
 
         # 6. 像素坐标 → UE 世界坐标
+        # 注意：OBJ 在 UE 导入时会做右手系→左手系转换，Y 被翻转。
+        # CSV 直接作为 UE 世界坐标读入。OBJ 导出为右手系 Z-up（Y=-north），
+        # UE 导入后翻为左手系（Y=+south），所以 CSV 的 Y 应与 UE 中 mesh 一致：
+        # Y_ue = +r*scale - H/2*scale。
         x = (c_sampled / SCALE) * PX_M * self.ue_scale
-        y = -((r_sampled / SCALE) * PX_M * self.ue_scale)
+        y = ((r_sampled / SCALE) * PX_M * self.ue_scale)
         x -= (W / SCALE) * PX_M * self.ue_scale * 0.5
-        y += (H / SCALE) * PX_M * self.ue_scale * 0.5
+        y -= (H / SCALE) * PX_M * self.ue_scale * 0.5
 
         r_i = np.clip(np.round(r_sampled).astype(np.int64), 0, H - 1)
         c_i = np.clip(np.round(c_sampled).astype(np.int64), 0, W - 1)
@@ -503,13 +512,211 @@ class AdaptiveTerrainBuilder:
         print(f"  中心线提取耗时 {time.time()-t0:.1f}s")
 
     def _generate_velocity_field(self, resolution: int = 2048):
-        """以中心线为骨架生成水体静态速度场纹理。"""
+        """以中心线为主、岸边切线影响、加低频扰动生成水体速度场纹理。
+
+        输出通道：
+          R：世界空间流向 X 分量（[-1,1] 映射到 [0,1]）
+          G：世界空间流向 Y 分量（[-1,1] 映射到 [0,1]）
+          B：速度大小（中心≈1，岸边≈0，叠加轻微噪声）
+          A：水体掩膜
+
+        纹理按 V-up 生成，PNG 顶部存图像底部，与 UE 里水体 mesh UV 方向一致。
+        """
         if self.centerline_points is None or len(self.centerline_points) < 2:
             print("  中心线缺失，跳过速度场生成")
             return
         if not self.water_verts:
             print("  水面网格为空，跳过速度场生成")
             return
+
+        print("生成水体速度场纹理...")
+        t0 = time.time()
+        H, W = self.water_mask.shape
+
+        # 1. 计算速度场分辨率
+        max_side = max(W, H)
+        if max_side <= resolution:
+            res_w, res_h = W, H
+        else:
+            scale = resolution / max_side
+            res_w = int(round(W * scale))
+            res_h = int(round(H * scale))
+        print(f"  速度场分辨率: {res_w}x{res_h}")
+
+        # 2. 水体像素坐标（下采样到目标分辨率）
+        if res_h != H or res_w != W:
+            water_mask_small = cv2.resize(
+                self.water_mask.astype(np.uint8) * 255,
+                (res_w, res_h),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 0
+        else:
+            water_mask_small = self.water_mask
+        water_idx = np.argwhere(water_mask_small)  # (M, 2) [r, c]
+        if len(water_idx) == 0:
+            print("  无水体像素，跳过速度场生成")
+            return
+
+        # 3. 中心线切线（在速度场分辨率下）
+        scale_xy = PX_M * self.ue_scale / SCALE
+        cl = self.centerline_points[:, :2].astype(np.float64)
+        c_cl = cl[:, 0] / scale_xy + W * 0.5
+        r_cl = cl[:, 1] / scale_xy + H * 0.5
+        c_cl *= res_w / W
+        r_cl *= res_h / H
+        cl_res = np.column_stack([r_cl, c_cl]).astype(np.float32)
+
+        tangents = np.empty_like(cl_res)
+        tangents[1:-1] = cl_res[2:] - cl_res[:-2]
+        tangents[0] = cl_res[1] - cl_res[0]
+        tangents[-1] = cl_res[-1] - cl_res[-2]
+        norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+        norms[norms < 1e-8] = 1.0
+        tangents = tangents / norms
+
+        from scipy.spatial import cKDTree
+        cl_tree = cKDTree(cl_res)
+
+        # 4. 平滑岸边切线场（高斯模糊 + Sobel 梯度，垂直方向即为切线）
+        bd_mask_small = ~water_mask_small
+        bd_idx = np.argwhere(bd_mask_small)
+        if len(bd_idx) == 0:
+            print("  无岸边，跳过速度场生成")
+            return
+        bd_tree = cKDTree(bd_idx.astype(np.float32))
+
+        blurred = cv2.GaussianBlur(water_mask_small.astype(np.float32), (0, 0), sigmaX=8.0)
+        gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=5)
+        gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=5)
+        grad_norm = np.sqrt(gx * gx + gy * gy)
+        grad_norm[grad_norm < 1e-8] = 1.0
+        # 切线场 (r, c) 方向 = 垂直于梯度
+        tangent_r = -gx / grad_norm
+        tangent_c = gy / grad_norm
+        bd_tangents = np.column_stack([
+            tangent_r[bd_idx[:, 0], bd_idx[:, 1]],
+            tangent_c[bd_idx[:, 0], bd_idx[:, 1]],
+        ]).astype(np.float32)
+
+        # 5. 每个水体像素：中心线切线 + 岸边切线加权
+        dist_cl, idx_cl = cl_tree.query(water_idx.astype(np.float32), k=1)
+        direction = tangents[idx_cl].copy()
+
+        dist_bd, idx_bd = bd_tree.query(water_idx.astype(np.float32), k=1)
+        bank_tangent = bd_tangents[idx_bd]
+        # 岸边切线可能与中心线反向，统一方向
+        dot = np.sum(direction * bank_tangent, axis=1)
+        bank_tangent[dot < 0] *= -1
+
+        # 岸边影响：离岸边越近影响越大，中心线处影响为 0
+        max_bank_dist = max(dist_bd.max(), 1e-6)
+        bank_influence = 1.0 - np.clip(dist_bd / max_bank_dist, 0.0, 1.0)
+        bank_influence = np.power(bank_influence, 1.5)
+
+        direction = (1.0 - bank_influence[:, None]) * direction + \
+                    bank_influence[:, None] * bank_tangent
+
+        # 6. 低频 Perlin 噪声扰动方向与速度
+        noise = self._perlin_noise(res_h, res_w, octaves=4, base_grid=16, seed=self.velocity_seed)
+        noise_vals = noise[water_idx[:, 0], water_idx[:, 1]]
+        noise_angle = noise_vals * self.velocity_noise_scale
+        cos_a = np.cos(noise_angle)
+        sin_a = np.sin(noise_angle)
+        rot_dir = np.empty_like(direction)
+        rot_dir[:, 0] = direction[:, 0] * cos_a - direction[:, 1] * sin_a
+        rot_dir[:, 1] = direction[:, 0] * sin_a + direction[:, 1] * cos_a
+        direction = rot_dir
+
+        dnorm = np.linalg.norm(direction, axis=1, keepdims=True)
+        dnorm[dnorm < 1e-8] = 1.0
+        direction = direction / dnorm
+
+        # 7. 速度：中心快、岸边慢，叠加轻微噪声
+        speed = np.clip(dist_bd / max_bank_dist, 0.0, 1.0)
+        speed = speed * (1.0 + 0.2 * noise_vals)
+        speed = np.clip(speed, 0.0, 1.0)
+
+        # 8. 组装输出纹理（V-up）
+        tex = np.zeros((res_h, res_w, 4), dtype=np.float32)
+        row_vup = res_h - 1 - water_idx[:, 0]
+        tex[row_vup, water_idx[:, 1], 0] = direction[:, 1] * 0.5 + 0.5
+        tex[row_vup, water_idx[:, 1], 1] = direction[:, 0] * 0.5 + 0.5
+        tex[row_vup, water_idx[:, 1], 2] = speed
+        tex[row_vup, water_idx[:, 1], 3] = 1.0
+
+        out = Path(self.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        vel_path = out / "terrain_velocity_field.png"
+        vel_uint8 = np.clip(tex * 255.0, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(vel_path), cv2.cvtColor(vel_uint8, cv2.COLOR_RGBA2BGRA))
+        print(f"  写入速度场纹理: {vel_path}")
+
+        preview = self._velocity_preview(direction, speed, water_idx, res_h, res_w)
+        preview_path = out / "terrain_velocity_field_preview.png"
+        cv2.imwrite(str(preview_path), preview)
+        print(f"  写入速度场预览: {preview_path}")
+
+        print(f"  速度场生成耗时 {time.time()-t0:.1f}s")
+
+    @staticmethod
+    def _perlin_noise(h, w, octaves=4, base_grid=16, seed=42):
+        """标准低频分形 Perlin 噪声，输出范围约 [-1, 1]。"""
+        rng = np.random.default_rng(seed)
+
+        def perlin_layer(gh, gw):
+            angles = rng.random((gh, gw), dtype=np.float32) * 2.0 * np.pi
+            grad_y, grad_x = np.cos(angles), np.sin(angles)
+
+            xs = np.linspace(0.0, gw - 1.0, w, endpoint=False, dtype=np.float32)
+            ys = np.linspace(0.0, gh - 1.0, h, endpoint=False, dtype=np.float32)
+            xv, yv = np.meshgrid(xs, ys, indexing='xy')
+
+            x0 = np.floor(xv).astype(np.int32)
+            y0 = np.floor(yv).astype(np.int32)
+            xf = xv - x0.astype(np.float32)
+            yf = yv - y0.astype(np.float32)
+
+            u = xf * xf * (3.0 - 2.0 * xf)
+            v = yf * yf * (3.0 - 2.0 * yf)
+
+            x1 = np.clip(x0 + 1, 0, gw - 1)
+            y1 = np.clip(y0 + 1, 0, gh - 1)
+            x0 = np.clip(x0, 0, gw - 1)
+            y0 = np.clip(y0, 0, gh - 1)
+
+            n00 = grad_x[y0, x0] * xf + grad_y[y0, x0] * yf
+            n01 = grad_x[y0, x1] * (xf - 1.0) + grad_y[y0, x1] * yf
+            n10 = grad_x[y1, x0] * xf + grad_y[y1, x0] * (yf - 1.0)
+            n11 = grad_x[y1, x1] * (xf - 1.0) + grad_y[y1, x1] * (yf - 1.0)
+
+            nx0 = n00 + (n01 - n00) * u
+            nx1 = n10 + (n11 - n10) * u
+            return nx0 + (nx1 - nx0) * v
+
+        noise = np.zeros((h, w), dtype=np.float32)
+        freq, amp, total = 1.0, 1.0, 0.0
+        for _ in range(octaves):
+            gh = max(2, int(round(base_grid * freq)))
+            gw = max(2, int(round(base_grid * freq)))
+            noise += perlin_layer(gh, gw) * amp
+            total += amp
+            freq *= 2.0
+            amp *= 0.5
+
+        return noise / total
+
+    @staticmethod
+    def _velocity_preview(direction, profile, water_idx, h, w):
+        """HSV 流向预览：色相=方向，亮度=速度（V-up 布局，与 UE 纹理一致）。"""
+        angle = np.arctan2(direction[:, 0], direction[:, 1])
+        hue = ((angle + np.pi) / (2.0 * np.pi) * 180).astype(np.uint8)
+        val = (profile * 255).astype(np.uint8)
+        hsv = np.zeros((h, w, 3), dtype=np.uint8)
+        row_vup = h - 1 - water_idx[:, 0]
+        hsv[row_vup, water_idx[:, 1], 0] = hue
+        hsv[row_vup, water_idx[:, 1], 1] = 255
+        hsv[row_vup, water_idx[:, 1], 2] = val
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
     # ═══════════════════════════════════════════════════════════════
     # 法线与导出
@@ -622,6 +829,11 @@ def main():
     p.add_argument("--out-dir", default="output/terrain_adaptive", help="地形 OBJ 输出目录")
     p.add_argument("--boundary-step", type=int, default=BOUNDARY_SAMPLE_STEP, help="边界采样步长")
     p.add_argument("--velocity-res", type=int, default=2048, help="速度场纹理最长边像素数")
+    p.add_argument("--velocity-seed", type=int, default=42, help="Perlin 噪声随机种子")
+    p.add_argument("--velocity-noise", type=float, default=0.15, help="流向噪声强度（弧度）")
+    p.add_argument("--velocity-bank-weight", type=float, default=0.35, help="岸边切线加权强度")
+    p.add_argument("--velocity-bank-falloff", type=float, default=8.0, help="岸边切线影响距离衰减（像素）")
+    p.add_argument("--velocity-profile-power", type=float, default=1.5, help="速度廓线幂次")
     p.add_argument("--force", action="store_true",
                    help="强制重新生成所有中间文件；默认会利用已有文件")
     args = p.parse_args()
@@ -680,6 +892,11 @@ def main():
         boundary_sample_step=args.boundary_step,
     )
     terrain_builder.velocity_res = args.velocity_res
+    terrain_builder.velocity_seed = args.velocity_seed
+    terrain_builder.velocity_noise_scale = args.velocity_noise
+    terrain_builder.velocity_bank_weight = args.velocity_bank_weight
+    terrain_builder.velocity_bank_falloff = args.velocity_bank_falloff
+    terrain_builder.velocity_profile_power = args.velocity_profile_power
     terrain_builder.build()
 
 

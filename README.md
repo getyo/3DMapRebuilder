@@ -60,11 +60,12 @@
   │
   ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Stage 4: 自适应地形 OBJ（推荐入口）                          │
-│ gen_adaptive_terrain.py :: AdaptiveTerrainBuilder + main()   │
-│ 从 10x 标签 + 边界线 + DEM 生成 UE 可用 OBJ                  │
+│ Stage 4: 自适应地形 OBJ + 水体速度场（推荐入口）             │
+│ gen_adaptive_terrain_centerline.py :: AdaptiveTerrainBuilder + main() │
+│ 从 10x 标签 + 边界线 + DEM 生成 UE 可用 OBJ、中心线 CSV、速度场纹理 │
 │ 输出: terrain_ground.obj, terrain_water.obj, terrain_building.obj │
 │       terrain_water_centerline.csv, terrain_water_centerline_preview.png │
+│       terrain_velocity_field.png, terrain_velocity_field_preview.png │
 └─────────────────────────────────────────────────────────────┘
   │
   ▼
@@ -81,14 +82,14 @@
 | **VecClassifier** | 语义分类器 | `vec_raw.png`, `satellite.tif` | `water.tif`, `building.tif`, `road.tif`, `labels.tif` |
 | **LabelPostprocessor** | 标签后处理器 | `labels.tif` | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `preview_classification_noboundary.png` |
 | **SemanticMapBuilder** | 3DGS 点云生成器 | `labels.tif`, `dem.tif` | `semanticMap.ply` |
-| **AdaptiveTerrainBuilder** | 自适应地形生成器 | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `dem.tif` | `terrain_ground.obj`, `terrain_water.obj`, `terrain_building.obj`, `terrain_water_centerline.csv`, `terrain_water_centerline_preview.png` |
+| **AdaptiveTerrainBuilder** | 自适应地形生成器 | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `dem.tif` | `terrain_ground.obj`, `terrain_water.obj`, `terrain_building.obj`, `terrain_water_centerline.csv`, `terrain_water_centerline_preview.png`, `terrain_velocity_field.png`, `terrain_velocity_field_preview.png` |
 
 ## 五、使用说明
 
 ### 5.1 一键跑完整流程
 
 ```bash
-python gen_adaptive_terrain.py
+python gen_adaptive_terrain_centerline.py
 ```
 
 会依次执行：
@@ -100,7 +101,7 @@ python gen_adaptive_terrain.py
 ### 5.2 强制重新生成所有中间文件
 
 ```bash
-python gen_adaptive_terrain.py --force
+python gen_adaptive_terrain_centerline.py --force
 ```
 
 默认情况下会利用已有中间文件，只有缺失或指定 `--force` 时才重新生成。
@@ -119,8 +120,8 @@ python label_postprocess.py --input TestInput/SanHe/labels.tif --out-dir TestInp
 # 3DGS 语义地图
 python gen_semantic.py --label TestInput/SanHe/labels.tif --dem TestInput/SanHe/dem.tif --out TestInput/SanHe/semanticMap.ply
 
-# 自适应地形（完整管线）
-python gen_adaptive_terrain.py --label-dir TestInput/SanHe --dem TestInput/SanHe/dem.tif --out-dir output/terrain_adaptive
+# 自适应地形 + 中心线 + 速度场（完整管线）
+python gen_adaptive_terrain_centerline.py --label-dir TestInput/SanHe --dem TestInput/SanHe/dem.tif --out-dir output/terrain_adaptive
 ```
 
 也可通过 `test()` 函数以编程方式调用：
@@ -139,7 +140,7 @@ test(label_path='...', dem_path='...', out_path='...')
 ### 5.4 命令行参数
 
 ```bash
-python gen_adaptive_terrain.py --help
+python gen_adaptive_terrain_centerline.py --help
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -148,6 +149,12 @@ python gen_adaptive_terrain.py --help
 | `--dem` | `TestInput/SanHe/dem.tif` | DEM 路径 |
 | `--out-dir` | `output/terrain_adaptive` | 地形 OBJ 输出目录 |
 | `--boundary-step` | `1` | 边界采样步长（10x 像素） |
+| `--velocity-res` | `2048` | 速度场纹理最长边像素数 |
+| `--velocity-seed` | `42` | Perlin 噪声随机种子 |
+| `--velocity-noise` | `0.15` | 流向噪声强度（弧度） |
+| `--velocity-bank-weight` | `0.35` | 岸边切线加权强度 |
+| `--velocity-bank-falloff` | `8.0` | 岸边切线影响距离衰减（像素） |
+| `--velocity-profile-power` | `1.5` | 速度廓线幂次 |
 | `--force` | `False` | 强制重新生成所有中间文件 |
 
 ## 六、主要类型说明
@@ -174,11 +181,16 @@ python gen_adaptive_terrain.py --help
 
 ### 6.4 AdaptiveTerrainBuilder
 
-`gen_adaptive_terrain.py` 中的类，从 10x 标签 + 边界线 + DEM 生成 UE 可用的自适应分辨率地形 OBJ。
+`gen_adaptive_terrain_centerline.py` 中的类，从 10x 标签 + 边界线 + DEM 生成 UE 可用的自适应分辨率地形 OBJ，以及水体中心线 CSV 和速度场纹理。
 
-**新增能力**：
-- 从水体掩膜提取河流中心线，输出 CSV 供 UE DataTable 导入，支持水体扩散/流动系统的后续开发。
-- 调用 `velocity_field.py` 生成静态速度场纹理，作为后续 UE 材质/Niagara 的流动方向输入。
+**核心能力**：
+- 从水体掩膜提取河流中心线，输出 CSV 供 UE DataTable 导入。
+- 生成水体静态速度场纹理：以中心线切线规定主体流向，岸边切线影响近岸区域，并叠加低频 Perlin 噪声模拟不规则流动；速度采用"中心快、岸边慢"的分布。
+
+**坐标系**：
+- OBJ 导出使用右手系 Z-up：`X=east, Y=-north, Z=height`。
+- UE 导入 OBJ 时会做右手系→左手系转换，mesh 在 UE 里的实际坐标为 `X=east, Y=south, Z=height`。
+- 中心线 CSV 直接作为 UE 世界坐标读入，Y 轴与 UE 中 mesh 的 `Y=+south` 对齐。此前版本 CSV 的 Y 偏移符号有误，已修复。
 
 **核心策略**：
 - 粗网格 stride = 10 原始像素（100 10x 像素）。
@@ -186,7 +198,7 @@ python gen_adaptive_terrain.py --help
 - 粗网格顶点 + 密集边界点用 `scipy.spatial.Delaunay` 三角化，三角形大小自然自适应：内部大、边界密。
 - 每个三角形取重心位置的 10x class_id，分配到 `M_Ground` / `M_Road` / `M_Building` / `M_Water` 四个 UE 材质槽。
 - 水体通过 `distance_transform_edt` 生成凹包盆地，保留水边过渡。
-- 坐标系为 UE 左手系 Z-up：`X=east, Y=-north, Z=height`。
+- 坐标系：OBJ 导出为右手系 Z-up `X=east, Y=-north, Z=height`；UE 导入后 mesh 实际为左手系 `X=east, Y=south, Z=height`。
 
 **设计特点**：
 
@@ -221,12 +233,46 @@ python gen_adaptive_terrain.py --help
 - `output/terrain_adaptive/terrain_building.mtl` — 建筑材质定义
 - `output/terrain_adaptive/terrain_water_centerline.csv` — 河流中心线点序列（UE DataTable 格式）
 - `output/terrain_adaptive/terrain_water_centerline_preview.png` — 水体掩膜 + 红色中心线预览
-- `output/terrain_adaptive/terrain_velocity_field.png` — 水体静态速度场纹理（RG=方向，B=有效掩膜）
-- `output/terrain_adaptive/terrain_velocity_field_preview.png` — 速度场流向可视化预览
+- `output/terrain_adaptive/terrain_velocity_field.png` — 水体静态速度场纹理（PNG，RGBA）：R=世界空间流向 X，G=世界空间流向 Y，B=速度大小（河道中心≈1，岸边→0，并叠加轻微噪声扰动），A=水体掩膜
+- `output/terrain_adaptive/terrain_velocity_field_preview.png` — 速度场流向可视化预览（V-up 布局，与 UE 纹理一致）
 
-## 九、水体扩散实现管线
+## 九、速度场纹理设计与水体扩散管线
 
-本章节说明当前已接入的水体扩散相关流程，以及后续与 UE 对接的步骤。
+### 9.1 速度场纹理设计
+
+速度场离线生成，导出 PNG 后导入 UE 作为 Texture2D，按水体 mesh 的 UV 直接采样。
+
+**通道分配**：
+
+| 通道 | 内容 | 说明 |
+|------|------|------|
+| **R** | 世界空间流向 X（-1~1 映射到 0~1） | 归一化方向，中心线切线 + 两岸加权 + Perlin 噪声 |
+| **G** | 世界空间流向 Y（-1~1 映射到 0~1） | 同上 |
+| **B** | 速度廓线系数（0~1） | 中心线附近 ≈ 1，岸边趋近 0 |
+| **A** | 水体掩膜 | 1 = 有效水体区域，0 = 非水体/无效 |
+
+**UV 对齐**：水体 mesh 的 UV AABB 为 `[0,1]×[0,1]`。速度场纹理按 V-up 生成（PNG 顶部存图像底部），与 UE 导入 OBJ 后的 mesh UV 方向一致，采样时直接按水体 UV 取即可吻合。
+
+**方向计算（Python 端）**：
+1. 对水体每个像素，找中心线最近点，取切线方向为基础流。
+2. 找最近岸边点，取岸边切线（高斯模糊 + Sobel 梯度计算，平滑二值边界锯齿）。
+3. 按到岸边距离加权混合：中心区域以中心线切线为主，靠近岸边时岸边切线影响增大。
+4. 叠加低频分形 Perlin 噪声扰动，打破规律感。
+5. 归一化后存 R/G。
+
+**速度大小（Python 端）**：
+- 以到岸边距离控制基础速度：河道中心快、岸边慢。
+- 叠加低频噪声做轻微速度扰动，模拟水流不规则性。
+- 最终 B 通道 = `基础速度 × (1 + 0.2 × 噪声)`，范围裁剪到 `[0, 1]`。
+
+**速度大小（UE 端）**：
+- Python 已输出方向和带扰动的速度标量。
+- UE 中 `BaseSpeed` Scalar 参数控制整体流速。
+- 最终速度 = `normalize(R,G) × BaseSpeed × B`。
+
+**污染源**：完全独立，用户另行控制注入位置和颜色，速度场只负责"已注入的物质怎么被带走"。
+
+### 9.2 水体扩散实现管线
 
 ```
 Python 端
@@ -235,12 +281,12 @@ Python 端
   │
   ├── label_postprocess.py → labels_10x_no_boundary.tif（10x 水体掩膜）
   │
-  └── gen_adaptive_terrain.py
+  └── gen_adaptive_terrain_centerline.py
         │
         ├── 生成 terrain_water.obj（水面网格，供 UE 渲染）
         ├── 生成 terrain_water_centerline.csv（河流中心线，UE DataTable 导入）
         ├── 生成 terrain_water_centerline_preview.png（人工校验）
-        └── 调用 velocity_field.py 生成 terrain_velocity_field.png（静态速度场）
+        └── 生成 terrain_velocity_field.png（静态速度场纹理）
 
 UE 端
   │
@@ -256,7 +302,7 @@ UE 端
   │     生成沿河流中心的 Spline
   │
   ├── 扩散 RT 模拟：
-  │     扩散 Grid 的每个格子通过世界坐标/水体 UV 采样速度场 Texture，
+  │     扩散 Grid 的每个格子按水体 UV 采样速度场 Texture，
   │     用速度方向做 Semi-Lagrangian Advection，实现污染物随水流扩散。
   │
   └── 如需动态/更复杂河岸插值，可在 UE 中按 Spline 实时生成速度场 RT 替代静态纹理。
@@ -265,7 +311,9 @@ UE 端
 ## 十、待办
 
 - [ ] Stage 5：UE 语义层（材质系统、语义查询、区域过滤、交互编辑）
-- [ ] 水体污染扩散 Grid2D 与 UE 材质联动
+- [x] 水体污染扩散 Grid2D 与 UE 材质联动（基础速度场纹理已接入；中心线 CSV Y 偏移已修复）
+- [x] 速度场重构：中心线切线 + 岸边切线加权 + 低频 Perlin 噪声，中心快、岸边慢
+- [ ] 污染源注入系统（位置、颜色，与速度场解耦）
 - [ ] 完整版 3DGS：从卫星图直出完整 3DGS 渲染点云（需补充三维信息输入）
 - [ ] labels.tif 第三通道补入真实建筑高度（GBA 或阴影法）
 - [ ] 多测试区域支持
