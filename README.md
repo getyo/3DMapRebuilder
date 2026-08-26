@@ -22,7 +22,7 @@
 分类 → 后处理 → AI 生成 3DGS 地图 → 转化为 OBJ → UE 制作语义层
 ```
 
-当前阶段出于简化和输入数据不足（只有卫星图，缺乏三维信息）的原因，先制作**简化的 3DGS 语义地图**（`gen_semantic.py`），并新增**自适应分辨率地形 OBJ 生成**（`gen_adaptive_terrain.py`），直接供 UE 使用。
+当前阶段出于简化和输入数据不足（只有卫星图，缺乏三维信息）的原因，先制作**简化的 3DGS 语义地图**（`gen_semantic.py`），并新增**自适应分辨率地形 OBJ 生成**（`gen_adaptive_terrain_centerline.py`，含水体中心线与速度场），直接供 UE 使用。
 
 未来输入数据具备真实三维信息后，可用卫星图直出完整 3DGS 渲染点云，替换当前简化版语义地图。
 
@@ -112,7 +112,7 @@ python gen_adaptive_terrain_centerline.py --force
 
 ```bash
 # 语义分类
-python classify_vecw.py --vec TestInput/SanHe/vec_raw.png --sate TestInput/SanHe/satellite.tif --out TestInput/SanHe
+python classify_vecw.py --vec TestInput/SanHe/vec_raw.png --sat TestInput/SanHe/satellite.tif --out-dir TestInput/SanHe
 
 # 标签后处理
 python label_postprocess.py --input TestInput/SanHe/labels.tif --out-dir TestInput/SanHe/Output_10x
@@ -152,9 +152,9 @@ python gen_adaptive_terrain_centerline.py --help
 | `--velocity-res` | `2048` | 速度场纹理最长边像素数 |
 | `--velocity-seed` | `42` | Perlin 噪声随机种子 |
 | `--velocity-noise` | `0.15` | 流向噪声强度（弧度） |
-| `--velocity-bank-weight` | `0.35` | 岸边切线加权强度 |
-| `--velocity-bank-falloff` | `8.0` | 岸边切线影响距离衰减（像素） |
-| `--velocity-profile-power` | `1.5` | 速度廓线幂次 |
+| `--velocity-bank-weight` | `0.35` | 岸边切线加权强度（预留参数，算法内部为硬编码值，暂不生效） |
+| `--velocity-bank-falloff` | `8.0` | 岸边切线影响距离衰减（像素，预留参数，暂不生效） |
+| `--velocity-profile-power` | `1.5` | 速度廓线幂次（预留参数，暂不生效） |
 | `--force` | `False` | 强制重新生成所有中间文件 |
 
 ## 六、主要类型说明
@@ -183,27 +183,33 @@ python gen_adaptive_terrain_centerline.py --help
 
 `gen_adaptive_terrain_centerline.py` 中的类，从 10x 标签 + 边界线 + DEM 生成 UE 可用的自适应分辨率地形 OBJ，以及水体中心线 CSV 和速度场纹理。
 
-**核心能力**：
-- 从水体掩膜提取河流中心线，输出 CSV 供 UE DataTable 导入。
-- 生成水体静态速度场纹理：以中心线切线规定主体流向，岸边切线影响近岸区域，并叠加低频 Perlin 噪声模拟不规则流动；速度采用"中心快、岸边慢"的分布。
-
 **坐标系**：
 - OBJ 导出使用右手系 Z-up：`X=east, Y=-north, Z=height`。
 - UE 导入 OBJ 时会做右手系→左手系转换，mesh 在 UE 里的实际坐标为 `X=east, Y=south, Z=height`。
 - 中心线 CSV 直接作为 UE 世界坐标读入，Y 轴与 UE 中 mesh 的 `Y=+south` 对齐。此前版本 CSV 的 Y 偏移符号有误，已修复。
 
 **核心策略**：
-- 粗网格 stride = 10 原始像素（100 10x 像素）。
-- 从 `boundary_lines_10x.png` 细化出 1 像素宽 10x 边界线。
-- 粗网格顶点 + 密集边界点用 `scipy.spatial.Delaunay` 三角化，三角形大小自然自适应：内部大、边界密。
-- 每个三角形取重心位置的 10x class_id，分配到 `M_Ground` / `M_Road` / `M_Building` / `M_Water` 四个 UE 材质槽。
-- 水体通过 `distance_transform_edt` 生成凹包盆地，保留水边过渡。
-- 坐标系：OBJ 导出为右手系 Z-up `X=east, Y=-north, Z=height`；UE 导入后 mesh 实际为左手系 `X=east, Y=south, Z=height`。
 
-**设计特点**：
+1. 地图生成
 
-- 纯数值运算（重心计算、顶点生成、法线计算等）采用 NumPy 向量化实现，保留逻辑密集环节（裙边检测、面分配）的显式循环以确保可维护性。
-- OBJ 导出采用批量字符串拼接，减少小写入开销。
+   - 粗网格 stride = 10 原始像素（100 10x 像素）。
+
+   - 从 `boundary_lines_10x.png` 细化出 1 像素宽 10x 边界线。
+
+   - 粗网格顶点 + 密集边界点用 `scipy.spatial.Delaunay` 三角化，三角形大小自然自适应：内部大、边界密。
+
+   - 每个三角形取重心位置的 10x class_id，分配到地面 OBJ 的 `M_Ground` / `M_Road` / `M_WaterBed` / `M_Building` 与水面 OBJ 的 `M_Water` 材质槽。
+
+   - 水体通过 `distance_transform_edt` 生成凹包盆地，保留水边过渡。
+
+2. 水体中心线提取与速度场生成速度场生成
+
+   - 从水体掩膜提取河流中心线，输出 CSV 供 UE DataTable 导入。
+
+   - 生成水体静态速度场纹理：以中心线切线规定主体流向，岸边切线影响近岸区域，并叠加低频 Perlin 噪声模拟不规则流动；速度采用"中心快、岸边慢"的分布。
+
+
+
 
 ## 七、输入文件
 
@@ -313,7 +319,7 @@ UE 端
 - [ ] Stage 5：UE 语义层（材质系统、语义查询、区域过滤、交互编辑）
 - [x] 水体污染扩散 Grid2D 与 UE 材质联动（基础速度场纹理已接入；中心线 CSV Y 偏移已修复）
 - [x] 速度场重构：中心线切线 + 岸边切线加权 + 低频 Perlin 噪声，中心快、岸边慢
-- [ ] 污染源注入系统（位置、颜色，与速度场解耦）
+- [x] 污染源注入系统（位置、颜色，与速度场解耦）
 - [ ] 完整版 3DGS：从卫星图直出完整 3DGS 渲染点云（需补充三维信息输入）
 - [ ] labels.tif 第三通道补入真实建筑高度（GBA 或阴影法）
 - [ ] 多测试区域支持

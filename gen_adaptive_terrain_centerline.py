@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-gen_adaptive_terrain.py -- 自适应分辨率 UE 地形生成器
+gen_adaptive_terrain_centerline.py -- 自适应分辨率 UE 地形生成器（含水体中心线与速度场）
 
 本文件是完整管线的唯一入口（main），负责：
   1. 语义分类（classify_vecw.py）
   2. 标签后处理（label_postprocess.py）
   3. 简化 3DGS 语义地图（gen_semantic.py）
   4. 自适应分辨率地形 OBJ 生成（本文件 AdaptiveTerrainBuilder）
+  5. 水体中心线提取与静态速度场纹理生成（_extract_centerline / _generate_velocity_field）
 
-其他模块仅通过 test() 方法自检输入并运行，不持有 main 入口。
+classify_vecw / label_postprocess / gen_semantic 三个模块也可通过各自的 main() 独立运行。
 """
 
 import argparse
@@ -89,6 +90,9 @@ class AdaptiveTerrainBuilder:
       - terrain_building.obj：建筑核心区域顶面
       - terrain_water.obj：蓝色水面盖子
     三个 OBJ 同坐标系，UE 000 对齐。
+
+    此外基于水体掩膜提取河流中心线（CSV + 预览图），
+    并生成水体静态速度场纹理（流向 R/G + 速度 B + 掩膜 A，供 UE 水体扩散模拟采样）。
     """
 
     def __init__(
@@ -115,6 +119,10 @@ class AdaptiveTerrainBuilder:
         self.water_edge_width = water_edge_width
         self.building_buffer_depth = building_buffer_depth
         self.ue_scale = ue_scale
+        # 速度场相关参数。
+        # 注意：velocity_bank_weight / velocity_bank_falloff / velocity_profile_power
+        # 为预留参数（CLI 已暴露），当前 _generate_velocity_field 内部使用硬编码值，
+        # 尚未接入算法，调整对应 CLI 参数不会生效。
         self.velocity_res = 2048
         self.velocity_seed = 42
         self.velocity_noise_scale = 0.15
