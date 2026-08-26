@@ -9,11 +9,8 @@
   preview_classification_noboundary.png — 可视化预览
 """
 
-import os
-import sys
-
-# 确保脚本所在目录在导入路径中（兼容 standalone 运行）
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import argparse
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -24,10 +21,6 @@ try:
     HAS_RASTERIO = True
 except ImportError:
     HAS_RASTERIO = False
-
-from classify_vecw import VecClassifier, SANHE_VEC, SANHE_SATE, SANHE_LABEL_DIR
-from gen_semantic import SemanticMapBuilder
-from gen_adaptive_terrain import AdaptiveTerrainBuilder
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -89,7 +82,7 @@ class LabelPostprocessor:
 
     def process(self):
         """执行完整后处理流程"""
-        os.makedirs(self.output_dir, exist_ok=True)
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
         self._load_input()
         self._upsample()
@@ -224,12 +217,13 @@ class LabelPostprocessor:
 
         out_labels = np.stack([self._out_band1, self._out_band2, self._out_band3], axis=0)
 
-        path_labels_tif = os.path.join(self.output_dir, "labels_10x_no_boundary.tif")
-        path_boundary_png = os.path.join(self.output_dir, "boundary_lines_10x.png")
-        path_vis_png = os.path.join(self.output_dir, "preview_classification_noboundary.png")
+        out_dir = Path(self.output_dir)
+        path_labels_tif = out_dir / "labels_10x_no_boundary.tif"
+        path_boundary_png = out_dir / "boundary_lines_10x.png"
+        path_vis_png = out_dir / "preview_classification_noboundary.png"
 
-        cv2.imwrite(path_boundary_png, self._boundary)
-        cv2.imwrite(path_vis_png, cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(path_boundary_png), self._boundary)
+        cv2.imwrite(str(path_vis_png), cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR))
 
         if HAS_RASTERIO and self._profile is not None:
             self._profile.update(
@@ -239,7 +233,7 @@ class LabelPostprocessor:
                 height=self._H_10x,
                 transform=self._profile['transform'] * self._profile['transform'].scale(0.1, 0.1)
             )
-            with rasterio.open(path_labels_tif, 'w', **self._profile) as dst:
+            with rasterio.open(str(path_labels_tif), 'w', **self._profile) as dst:
                 dst.write(out_labels)
             print(f"[OK] 10x GeoTIFF 已保存: {path_labels_tif}")
 
@@ -356,36 +350,23 @@ class LabelPostprocessor:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 入口
+# 独立测试入口
 # ═══════════════════════════════════════════════════════════════
 
+def test(input_path: str = None, output_dir: str = None):
+    """检测标签后处理器输入是否有效，无效则报错，有效则运行。"""
+    pp = LabelPostprocessor(input_path, output_dir)
+    if not Path(pp.input_path).is_file():
+        raise FileNotFoundError(f"缺少输入: {pp.input_path}")
+    pp.process()
+
+
 def main():
-    """完整流程入口：分类 → 后处理 → 3DGS语义地图 → 自适应地形OBJ"""
-    # 1. 语义分类
-    classifier = VecClassifier()
-    classifier.set_input(SANHE_VEC, SANHE_SATE)
-    classifier.set_output(SANHE_LABEL_DIR)
-    classifier.run()
-
-    # 2. 标签后处理（10x 上采样 + 轮廓平滑）
-    postprocessor = LabelPostprocessor(
-        input_path=classifier.label_out,
-        output_dir=os.path.join(SANHE_LABEL_DIR, "Output_10x")
-    )
-    postprocessor.process()
-
-    # 3. 语义地图生成（简化版 3DGS 点云）
-    semantic_builder = SemanticMapBuilder(label_path=classifier.label_out)
-    semantic_builder.build()
-
-    # 4. 自适应分辨率地形 OBJ（供 UE 使用）
-    terrain_builder = AdaptiveTerrainBuilder(
-        label_10x_path=os.path.join(SANHE_LABEL_DIR, "Output_10x", "labels_10x_no_boundary.tif"),
-        boundary_path=os.path.join(SANHE_LABEL_DIR, "Output_10x", "boundary_lines_10x.png"),
-        dem_path=os.path.join(SANHE_LABEL_DIR, "dem.tif"),
-        out_dir=os.path.join(SANHE_LABEL_DIR, "Output_10x", "terrain_adaptive"),
-    )
-    terrain_builder.build()
+    p = argparse.ArgumentParser(description="语义标签后处理器（10x 上采样 + 轮廓平滑）")
+    p.add_argument("--input", default="TestInput/SanHe/labels.tif", help="输入 labels.tif 路径")
+    p.add_argument("--out-dir", default="TestInput/SanHe/Output_10x", help="输出目录")
+    args = p.parse_args()
+    test(args.input, args.out_dir)
 
 
 if __name__ == "__main__":

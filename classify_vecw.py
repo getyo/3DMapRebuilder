@@ -10,18 +10,17 @@
   labels.tif    — 三通道语义标签图
 """
 
+import argparse
+import math
+from pathlib import Path
+from typing import NamedTuple
+
 import numpy as np
 from PIL import Image
 import rasterio
 from scipy.ndimage import binary_closing
-from typing import NamedTuple
-import os, math
 
-# ============ 1. 输入配置 ============
-SANHE_VEC = "TestInput\\SanHe\\vec_raw.png"
-SANHE_SATE = "TestInput\SanHe\satellite.tif"
-
-# ============ 2. RGBA 颜色常量 ============
+# ============ 1. RGBA 颜色常量 ============
 class RGBA(NamedTuple):
     """不可变 RGBA 颜色值"""
     R: int
@@ -29,8 +28,8 @@ class RGBA(NamedTuple):
     B: int
     A: int = 255
 
-# ============ 3. 输出配置 ============
-SANHE_LABEL_DIR = "TestInput\SanHe"
+# ============ 2. 输出配置 ============
+SANHE_LABEL_DIR = "TestInput/SanHe"
 
 # 精确标签颜色（基于用户提供的纯色样本）
 COLOR_WATER    = RGBA(171, 198, 239)  # 水体
@@ -57,20 +56,9 @@ def _match_rgba(r, g, b, color: RGBA, opaque):
 
 # ============ 3. 分类器 ============
 class VecClassifier:
-    """Vec 瓦片语义分类器，单例实现"""
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+    """Vec 瓦片语义分类器（普通类，非单例）"""
 
     def __init__(self):
-        if self._initialized:
-            return
-        self._initialized = True
         # 默认空路径
         self.InputVec      = ""
         self.water_out     = ""
@@ -87,23 +75,24 @@ class VecClassifier:
 
     def set_output(self, dir_path: str, prefix: str = ""):
         """设置输出目录和文件名前缀"""
-        self.water_out    = os.path.join(dir_path, f"{prefix}water.tif")
-        self.building_out = os.path.join(dir_path, f"{prefix}building.tif")
-        self.road_out     = os.path.join(dir_path, f"{prefix}road.tif")
-        self.label_out    = os.path.join(dir_path, f"{prefix}labels.tif")
+        d = Path(dir_path)
+        self.water_out    = str(d / f"{prefix}water.tif")
+        self.building_out = str(d / f"{prefix}building.tif")
+        self.road_out     = str(d / f"{prefix}road.tif")
+        self.label_out    = str(d / f"{prefix}labels.tif")
 
     def _check_paths(self):
         """检查所有输入输出路径是否合法"""
         # 输入
         if not self.InputVec:
             raise RuntimeError("InputVec not set. Call set_input() first.")
-        if not os.path.isfile(self.InputVec):
+        if not Path(self.InputVec).is_file():
             raise FileNotFoundError(f"Input vec image not found: {self.InputVec}")
 
         # 卫星图参考（用于读取 CRS/transform）
         if not self.reference_sat:
             raise RuntimeError("Reference satellite path is empty.")
-        if not os.path.isfile(self.reference_sat):
+        if not Path(self.reference_sat).is_file():
             raise FileNotFoundError(f"Reference satellite not found: {self.reference_sat}")
 
         # 输出
@@ -117,8 +106,8 @@ class VecClassifier:
         ]:
             if not path:
                 raise RuntimeError(f"{name}_out is empty.")
-            out_dir = os.path.dirname(path)
-            if out_dir and not os.path.isdir(out_dir):
+            out_dir = Path(path).parent
+            if out_dir and not out_dir.is_dir():
                 raise FileNotFoundError(f"Output directory does not exist: {out_dir}")
 
     # ──── 分类逻辑 ────
@@ -253,15 +242,38 @@ class VecClassifier:
             profile.update(count=count)
             with rasterio.open(path, "w", **profile) as dst:
                 dst.write(data.reshape(sH, sW) if data.ndim == 1 else data, 1)
-            print(f"  Saved {os.path.basename(path)}")
+            print(f"  Saved {Path(path).name}")
 
         profile.update(count=3)
         with rasterio.open(self.label_out, "w", **profile) as dst:
             dst.write(resize(class_id), 1)
             dst.write(resize(road_lvl), 2)
             dst.write(resize(height),   3)
-        print(f"  Saved {os.path.basename(self.label_out)}")
+        print(f"  Saved {Path(self.label_out).name}")
 
 
-# ============ 5. 入口 ============
-# 主入口已迁移至 label_postprocess.py
+# ============ 5. 独立测试入口 / CLI ============
+
+def test(vec_path: str = None, sat_path: str = None, out_dir: str = None):
+    """检测分类器输入是否有效，无效则报错，有效则运行。"""
+    clf = VecClassifier()
+    vec = vec_path or "TestInput/SanHe/vec_raw.png"
+    sat = sat_path or "TestInput/SanHe/satellite.tif"
+    out = out_dir or "TestInput/SanHe"
+    clf.set_input(vec, sat)
+    clf.set_output(out)
+    clf._check_paths()
+    clf.run()
+
+
+def main():
+    p = argparse.ArgumentParser(description="天地图 vec_w 语义标签分类器")
+    p.add_argument("--vec", default="TestInput/SanHe/vec_raw.png", help="vec_w 拼接图路径")
+    p.add_argument("--sat", default="TestInput/SanHe/satellite.tif", help="卫星图参考路径")
+    p.add_argument("--out-dir", default="TestInput/SanHe", help="输出目录")
+    args = p.parse_args()
+    test(args.vec, args.sat, args.out_dir)
+
+
+if __name__ == "__main__":
+    main()
