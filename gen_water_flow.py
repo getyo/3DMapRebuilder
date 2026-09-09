@@ -71,6 +71,7 @@ class WaterFlowBuilder:
         velocity_noise_scale: float = 0.15,
         velocity_branch_alpha: float = 0.5,
         velocity_branch_residual: float = 0.1,
+        velocity_converge: float = 0.0,
     ):
         self.label_10x_path = label_10x_path
         self.dem_path = dem_path
@@ -81,6 +82,7 @@ class WaterFlowBuilder:
         self.velocity_noise_scale = velocity_noise_scale  # 流向噪声强度（弧度）
         self.velocity_branch_alpha = velocity_branch_alpha      # 分流衰减幂次 α
         self.velocity_branch_residual = velocity_branch_residual  # 分流末端残余速度因子
+        self.velocity_converge = velocity_converge                # 向心偏转强度 k（0 = 关闭）
 
         self.H10 = self.W10 = 0
         self.water_mask = None
@@ -438,6 +440,25 @@ class WaterFlowBuilder:
         dnorm[dnorm < 1e-8] = 1.0
         direction = direction / dnorm
 
+        # 向心偏转后处理：流线轻微弯向中心线（中心/岸边/分流远端均收敛）
+        # 强度 s = k * 4p(1-p) * factor，方向取“指向中心”的垂直分量；
+        # 主体仍沿流只是微弯，k=0 时此步完全等价于关闭。
+        if self.velocity_converge > 0.0:
+            pixel_xy = water_idx.astype(np.float32)
+            to_center = net_pts[idx_net] - pixel_xy
+            dnet_safe = np.maximum(dist_net, 1e-3)
+            cvec = to_center / dnet_safe[:, None]          # 指向最近河网节点
+            cpar = np.sum(cvec * direction, axis=1, keepdims=True)
+            cperp = cvec - cpar * direction                # 垂直于流向的横向分量
+            cn = np.linalg.norm(cperp, axis=1, keepdims=True)
+            cn[cn < 1e-6] = 1.0
+            cperp = cperp / cn
+            s_bend = self.velocity_converge * 4.0 * channel_pos * (1.0 - channel_pos) * factor
+            direction = direction + s_bend[:, None] * cperp
+            dnorm2 = np.linalg.norm(direction, axis=1, keepdims=True)
+            dnorm2[dnorm2 < 1e-8] = 1.0
+            direction = direction / dnorm2
+
         # 速度 = 横向廓线(中心快岸边慢) × 分流衰减因子 × 噪声
         speed = (1.0 - channel_pos) * factor
         speed = speed * (1.0 + 0.2 * noise_vals)
@@ -569,6 +590,8 @@ def main():
                    help="分流速度衰减幂次 α，factor = (1 - d/L)^α")
     p.add_argument("--velocity-branch-residual", type=float, default=0.1,
                    help="分流末端残余速度因子（0~1）")
+    p.add_argument("--velocity-converge", type=float, default=0.0,
+                   help="向心偏转强度 k（0=关闭；流线轻微弯向中心线，中心/岸边/分流远端收敛）")
     args = p.parse_args()
     builder = WaterFlowBuilder(
         label_10x_path=args.label_10x,
@@ -579,6 +602,7 @@ def main():
         velocity_noise_scale=args.velocity_noise,
         velocity_branch_alpha=args.velocity_branch_alpha,
         velocity_branch_residual=args.velocity_branch_residual,
+        velocity_converge=args.velocity_converge,
     )
     for pth in (builder.label_10x_path, builder.dem_path):
         if not Path(pth).is_file():
