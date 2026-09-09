@@ -7,16 +7,16 @@
   - dem.tif                      高程（1x 分辨率，内部升采样到 10x）
 
 输出（写入 out_dir）：
-  - terrain_water_centerline.csv              主流中心线（UE DataTable 格式）
-  - terrain_water_centerline_preview.png      河网预览图（主流红 + 分流按速度衰减着色）
+  - terrain_water_centerline.csv              主流中心线（UE DataTable 格式，仅主流一条，不含分流）
+  - terrain_water_centerline_preview.png      河网预览图（白底黑水；主流红 10px + 分流按速度因子着色 5px）
   - terrain_velocity_field.png                静态速度场纹理（RGBA）
   - terrain_velocity_field_preview.png        速度场 HSV 预览图
 
 依赖关系：
   水体掩膜必须来自 label_postprocess 平滑后的 10x 标签，保证与
   terrain_water.obj 的水体区域一致；本模块不依赖 Delaunay / 地形网格，
-  可与地形 OBJ、3DGS 语义地图并行生成（主流程见
-  gen_adaptive_terrain_centerline.py 的三路并行编排）。
+  可与地形 OBJ 并行生成（主流程见
+  gen_adaptive_terrain_centerline.py 的并行编排）。
 
 河网模型（分流语义）：
   1. 水体掩膜下采样后骨架化，得到河网图；对每个连通分量：

@@ -6,7 +6,7 @@
 UE 世界坐标：
 
   - gen_adaptive_terrain_centerline.py   地形 OBJ 导出（导入 UE 后 Y 翻转）
-  - gen_water_flow.py                    中心线 CSV / 速度场纹理
+  - gen_water_flow.py                    主流中心线 CSV / 速度场纹理
 
 坐标换算不一致会直接导致 UE 里中心线 / 速度场与水面 mesh 错位（此前
 CSV 的 Y 偏移就踩过坑）。因此常量与换算集中在本文文件，各模块禁止

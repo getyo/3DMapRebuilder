@@ -3,13 +3,17 @@
 gen_adaptive_terrain_centerline.py — 自适应分辨率 UE 地形生成器 + 全管线编排入口
 
 职责划分：
-  1. 全管线编排入口（main）：分类 → 后处理 → 三路并行
-     （3DGS 语义地图 gen_semantic / 地形 OBJ 本文件 / 水体流场 gen_water_flow）
+  1. 全管线编排入口（main）：分类 → 后处理 → 两路并行
+     （地形 OBJ 本文件 / 水体流场 gen_water_flow）
   2. 地形构建 AdaptiveTerrainBuilder：从 10x 标签 + 边界线 + DEM 生成
      terrain_ground.obj / terrain_water.obj / terrain_building.obj
 
-水体中心线（CSV）与静态速度场纹理已独立为 gen_water_flow.py（WaterFlowBuilder），
-与地形 OBJ 无数据依赖，二者在并行阶段同时执行。坐标常量统一见 map_common.py。
+水体河网（主流 CSV + 分流/河网预览）与静态速度场纹理已独立为
+ gen_water_flow.py（WaterFlowBuilder），与地形 OBJ 无数据依赖，二者在并行阶段同时执行。
+坐标常量统一见 map_common.py。
+
+注：gen_semantic.py（3DGS 语义地图）已从本管线剔除，文件保留；
+需要时可单独运行 gen_semantic.py 生成 semanticMap.ply。
 
 classify_vecw / label_postprocess / gen_semantic / gen_water_flow
 均可通过各自的 main() 独立运行。
@@ -589,7 +593,7 @@ def run_terrain_stage(label_10x_path, boundary_path, dem_path, out_dir, boundary
 
 def _parse_regenerate(values):
     """解析 --regenerate 列表（支持逗号分隔与重复指定）。"""
-    allowed = {"classify", "postprocess", "semantic", "terrain", "flow"}
+    allowed = {"classify", "postprocess", "terrain", "flow"}
     parts = []
     for v in values or []:
         parts.extend(x.strip() for x in v.split(",") if x.strip())
@@ -608,10 +612,16 @@ def main():
     p.add_argument("--velocity-res", type=int, default=2048, help="速度场纹理最长边像素数")
     p.add_argument("--velocity-seed", type=int, default=42, help="Perlin 噪声随机种子")
     p.add_argument("--velocity-noise", type=float, default=0.15, help="流向噪声强度（弧度）")
+    p.add_argument("--velocity-branch-alpha", type=float, default=0.5,
+                   help="分流速度衰减幂次 α（传给 gen_water_flow）")
+    p.add_argument("--velocity-branch-residual", type=float, default=0.1,
+                   help="分流末端残余速度因子（传给 gen_water_flow）")
+    p.add_argument("--velocity-converge", type=float, default=0.0,
+                   help="向心偏转强度 k，0=关闭（传给 gen_water_flow）")
     p.add_argument("--force", action="store_true",
                    help="强制重新生成所有产物（含已有中间文件）")
     p.add_argument("--regenerate", action="append", default=[],
-                   help="只强制重新生成指定部分（classify/postprocess/semantic/terrain/flow，"
+                   help="只强制重新生成指定部分（classify/postprocess/terrain/flow，"
                         "可重复指定或以逗号分隔，如 --regenerate terrain,flow）；"
                         "其余部分仍按缓存逻辑（产物存在则跳过）")
     p.add_argument("--stage-terrain", action="store_true",
@@ -640,7 +650,6 @@ def main():
         return
 
     label_path = label_dir / "labels.tif"
-    semantic_ply = label_dir / "semanticMap.ply"
     obj_paths = [out_dir / "terrain_ground.obj", out_dir / "terrain_water.obj",
                  out_dir / "terrain_building.obj"]
     flow_paths = [out_dir / "terrain_water_centerline.csv",
@@ -671,16 +680,8 @@ def main():
         pp = LabelPostprocessor(input_path=str(label_path), output_dir=str(out_10x))
         pp.process()
 
-    # ── 3. 三路并行：3DGS 语义地图 / 地形 OBJ / 水体流场 ──
+    # ── 3. 两路并行：地形 OBJ / 水体流场（gen_semantic 已从管线剔除）──
     jobs = []
-    if not force_part("semantic") and semantic_ply.exists():
-        print(f"使用已有: {semantic_ply}")
-    else:
-        jobs.append((
-            "semantic",
-            [sys.executable, str(Path(__file__).parent / "gen_semantic.py"),
-             "--label", str(label_path), "--dem", dem_path, "--out", str(semantic_ply)],
-        ))
     if not force_part("terrain") and all(p.exists() for p in obj_paths):
         print(f"使用已有: 地形 OBJ（{out_dir}）")
     else:
@@ -701,7 +702,10 @@ def main():
              "--out-dir", str(out_dir),
              "--velocity-res", str(args.velocity_res),
              "--velocity-seed", str(args.velocity_seed),
-             "--velocity-noise", str(args.velocity_noise)],
+             "--velocity-noise", str(args.velocity_noise),
+             "--velocity-branch-alpha", str(args.velocity_branch_alpha),
+             "--velocity-branch-residual", str(args.velocity_branch_residual),
+             "--velocity-converge", str(args.velocity_converge)],
         ))
 
     failed = []
