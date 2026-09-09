@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-水体流场生成器（中心线 + 静态速度场）— 独立模块
+水体流场生成器（河网分解 + 分流速度场）— 独立模块
 
 输入：
   - labels_10x_no_boundary.tif   10x 语义标签（水体 = band1 == 0）
   - dem.tif                      高程（1x 分辨率，内部升采样到 10x）
 
 输出（写入 out_dir）：
-  - terrain_water_centerline.csv              河流中心线（UE DataTable 格式）
-  - terrain_water_centerline_preview.png      中心线预览图
+  - terrain_water_centerline.csv              主流中心线（UE DataTable 格式）
+  - terrain_water_centerline_preview.png      河网预览图（主流红 + 分流按速度衰减着色）
   - terrain_velocity_field.png                静态速度场纹理（RGBA）
   - terrain_velocity_field_preview.png        速度场 HSV 预览图
 
@@ -18,10 +18,17 @@
   可与地形 OBJ、3DGS 语义地图并行生成（主流程见
   gen_adaptive_terrain_centerline.py 的三路并行编排）。
 
-水体策略（与原地形模块行为保持一致）：
-  - 中心线：对水体掩膜下采样后骨架化，取最大连通分量的直径路径，
-    高斯平滑后按弧长重采样输出。多段不相连水体仍以最大连通分量驱动
-    整片水体的速度场，暂不区分河 / 湖。
+河网模型（分流语义）：
+  1. 水体掩膜下采样后骨架化，得到河网图；对每个连通分量：
+  2. 主流 = 该分量的直径路径（最长最短路径，方向 A→B），主流速度因子恒为 1。
+  3. 主流之外的边构成"分流树"，每条分流树以离 A 最近的汇口为根，方向从
+     汇口指向自身末端（水从主流分流出去）。
+  4. 分流内每个节点的速度因子 = max(residual, (1 - d/L)^α)，
+     其中 d 为该节点离汇口的图上距离，L 为该分流树的最大离汇距离，
+     α = velocity_branch_alpha，residual = velocity_branch_residual。
+  5. 主干上长出的分流树若有两条与主干相接（汊道环），按主流方向赋值、
+     速度因子恒为 1，不做衰减。
+  6. 独立的多个水体各自跑一遍上述流程，最终合并进同一张纹理。
 
 坐标与纹理约定（常量统一见 map_common.py）：
   - 中心线 CSV 的 y 为 UE 左手系 y=+south，与 UE 导入 OBJ 后的 mesh 一致。
@@ -41,13 +48,13 @@ import networkx as nx
 
 # 添加脚本目录到导入路径，确保 standalone 运行能找到同级模块
 sys.path.insert(0, str(Path(__file__).parent))
-from map_common import (UE_SCALE, UE_PER_PX10, PX10_PER_UE,
+from map_common import (UE_SCALE, UE_PER_PX10,
                         ue_x_of_col, ue_y_csv_of_row)
 
 
 class WaterFlowBuilder:
     """
-    从 10x 水体掩膜 + DEM 提取河流中心线并生成静态速度场纹理。
+    从 10x 水体掩膜 + DEM 提取河网（主流 + 分流）并生成静态速度场纹理。
 
     用法：
       b = WaterFlowBuilder(label_10x_path='...', dem_path='...', out_dir='...')
@@ -62,19 +69,31 @@ class WaterFlowBuilder:
         velocity_res: int = 2048,
         velocity_seed: int = 42,
         velocity_noise_scale: float = 0.15,
+        velocity_branch_alpha: float = 0.5,
+        velocity_branch_residual: float = 0.1,
     ):
         self.label_10x_path = label_10x_path
         self.dem_path = dem_path
         self.out_dir = out_dir
         # 速度场参数
-        self.velocity_res = velocity_res          # 纹理最长边像素数
-        self.velocity_seed = velocity_seed        # Perlin 噪声随机种子
+        self.velocity_res = velocity_res              # 纹理最长边像素数
+        self.velocity_seed = velocity_seed            # Perlin 噪声随机种子
         self.velocity_noise_scale = velocity_noise_scale  # 流向噪声强度（弧度）
+        self.velocity_branch_alpha = velocity_branch_alpha      # 分流衰减幂次 α
+        self.velocity_branch_residual = velocity_branch_residual  # 分流末端残余速度因子
 
         self.H10 = self.W10 = 0
         self.water_mask = None
         self.dem_10x = None
-        self.centerline_points = None   # 中心线世界坐标（N, 3）：x=east, y=+south, z=height
+        self.centerline_points = None   # 主流中心线世界坐标（N, 3）：x=east, y=+south, z=height
+
+        # 河网（骨架分辨率坐标）
+        self.water_small = None         # 下采样后的水体掩膜（骨架分辨率）
+        self.net_r = None               # (N,) 骨架节点行坐标
+        self.net_c = None               # (N,) 骨架节点列坐标
+        self.net_tan = None             # (N, 2) 节点切向（沿流向单位向量）
+        self.net_factor = None          # (N,) 节点速度因子
+        self.net_half = None            # (N,) 节点局部半宽（像素）
 
     # ═══════════════════════════════════════════════════════════════
     # 加载
@@ -100,19 +119,25 @@ class WaterFlowBuilder:
             print("  无水体像素")
 
     # ═══════════════════════════════════════════════════════════════
-    # 水体中心线提取
+    # 河网提取
     # ═══════════════════════════════════════════════════════════════
 
-    def _extract_centerline(self):
-        """从 water_mask 提取河流中心线，输出 CSV 与预览图。"""
+    @staticmethod
+    def _factor_color(factor):
+        """factor ∈ [0,1] → JET 色（低=蓝，高=红），用于预览着色。"""
+        v = int(round(np.clip(factor, 0.0, 1.0) * 255))
+        return cv2.applyColorMap(np.array([[v]], dtype=np.uint8), cv2.COLORMAP_JET)[0, 0]
+
+    def _extract_network(self):
+        """骨架化 + 河网分解，计算每个骨架节点的切向/速度因子/半宽，写 CSV 与预览。"""
         from skimage.morphology import skeletonize
-        from scipy.ndimage import gaussian_filter1d
+        from scipy.ndimage import gaussian_filter1d, distance_transform_edt
 
         if self.water_mask is None or not np.any(self.water_mask):
-            print("  无水体，跳过中心线提取")
+            print("  无水体，跳过河网提取")
             return
 
-        print("提取水体中心线...")
+        print("提取河网（主流 + 分流）...")
         t0 = time.time()
         H, W = self.water_mask.shape
 
@@ -131,18 +156,26 @@ class WaterFlowBuilder:
                 (W_small, H_small),
                 interpolation=cv2.INTER_NEAREST
             ) > 0
+        self.water_small = water_small
+        self._scale_factor = scale_factor
 
         skel = skeletonize(water_small)
         if not np.any(skel):
             print("  骨架为空，跳过")
             return
 
-        # 2. 8-邻接建图
         Hs, Ws = water_small.shape
+        # 局部半宽 = 骨架点到最近岸边的距离（骨架即中轴）
+        dist_bank = distance_transform_edt(water_small)
+
+        # 2. 8-邻接建图
         G = nx.Graph()
-        for r, c in zip(*np.where(skel)):
+        skel_nodes = list(zip(*np.where(skel)))
+        for r, c in skel_nodes:
             node = (int(r), int(c))
             G.add_node(node)
+        for r, c in skel_nodes:
+            node = (int(r), int(c))
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
                            (-1, -1), (-1, 1), (1, -1), (1, 1)]:
                 nr, nc = r + dr, c + dc
@@ -153,29 +186,125 @@ class WaterFlowBuilder:
             print("  骨架图为空，跳过")
             return
 
-        # 3. 取最大连通分量并找直径（两次 BFS）
-        components = list(nx.connected_components(G))
-        largest = max(components, key=len)
-        G_main = G.subgraph(largest).copy()
+        # 3. 按连通分量处理（独立水体各自成网）
+        components = sorted(nx.connected_components(G), key=len, reverse=True)
 
-        def bfs_farthest(start):
-            lengths = nx.single_source_shortest_path_length(G_main, start)
-            far_node = max(lengths, key=lengths.get)
-            return far_node, lengths
+        net_r, net_c, net_tan, net_factor, net_half = [], [], [], [], []
+        branch_segs = []   # (r1,c1,r2,c2,factor) 供预览画分流
+        trunk_skel = None  # 最大分量主流骨架路径（供 CSV/预览）
 
-        start = next(iter(G_main.nodes))
-        A, _ = bfs_farthest(start)
-        B, _ = bfs_farthest(A)
-        path = nx.shortest_path(G_main, A, B)
+        for ci, comp in enumerate(components):
+            sub = G.subgraph(comp).copy()
 
-        # 4. 映射回原始分辨率并平滑
-        path_full = [(r / scale_factor, c / scale_factor) for r, c in path]
+            def bfs_farthest(start):
+                lengths = nx.single_source_shortest_path_length(sub, start)
+                far_node = max(lengths, key=lengths.get)
+                return far_node, lengths
+
+            start = next(iter(sub.nodes))
+            A, _ = bfs_farthest(start)
+            B, _ = bfs_farthest(A)
+            trunk_path = nx.shortest_path(sub, A, B)   # 有序节点列表 A→B
+            trunk_set = set(trunk_path)
+            trunk_index = {n: i for i, n in enumerate(trunk_path)}
+
+            # 主流切向（骨架坐标）
+            tp = np.array(trunk_path, dtype=np.float64)  # (Np, 2) [r, c]
+            t_tan = np.zeros_like(tp)
+            if len(tp) >= 2:
+                t_tan[1:-1] = tp[2:] - tp[:-2]
+                t_tan[0] = tp[1] - tp[0]
+                t_tan[-1] = tp[-1] - tp[-2]
+            tnorm = np.linalg.norm(t_tan, axis=1, keepdims=True)
+            tnorm[tnorm < 1e-8] = 1.0
+            t_tan = t_tan / tnorm
+
+            for i, (r, c) in enumerate(trunk_path):
+                net_r.append(r)
+                net_c.append(c)
+                net_tan.append(t_tan[i].astype(np.float32))
+                net_factor.append(1.0)
+                net_half.append(max(float(dist_bank[r, c]), 0.5))
+
+            # 分流树 = 去掉主流边后的连通分量
+            trunk_edges = {frozenset((trunk_path[i], trunk_path[i + 1]))
+                           for i in range(len(trunk_path) - 1)}
+            branch_edges = [e for e in sub.edges() if frozenset(e) not in trunk_edges]
+            if branch_edges:
+                branch_graph = nx.Graph()
+                branch_graph.add_edges_from(branch_edges)
+                for bcomp in nx.connected_components(branch_graph):
+                    bsub = branch_graph.subgraph(bcomp).copy()
+                    b_trunk_nodes = [n for n in bcomp if n in trunk_set]
+                    non_trunk = [n for n in bcomp if n not in trunk_set]
+                    if not non_trunk:
+                        continue
+                    # 根 = 离 A 最近的汇口
+                    if b_trunk_nodes:
+                        root = min(b_trunk_nodes, key=lambda n: trunk_index[n])
+                    else:
+                        root = next(iter(bcomp))
+                    pred = dict(nx.bfs_predecessors(bsub, root))
+                    dist = nx.single_source_shortest_path_length(bsub, root)
+
+                    # 汊道环：两端都接主流且无悬空末端 → 因子恒 1
+                    is_anabranch = (len(b_trunk_nodes) >= 2 and
+                                    all(bsub.degree(n) != 1 for n in non_trunk))
+                    if is_anabranch:
+                        L_max = 1.0
+                    else:
+                        L_max = max((dist[n] for n in non_trunk if n in dist), default=0.0)
+                        if L_max <= 0:
+                            L_max = 1.0
+
+                    for n in non_trunk:
+                        d = dist.get(n, 0)
+                        if is_anabranch:
+                            fac = 1.0
+                        else:
+                            fac = max(self.velocity_branch_residual,
+                                      (1.0 - d / L_max) ** self.velocity_branch_alpha)
+                        net_r.append(n[0])
+                        net_c.append(n[1])
+                        p = pred.get(n)
+                        if p is not None:
+                            vec = np.array(n, dtype=np.float32) - np.array(p, dtype=np.float32)
+                        else:
+                            vec = np.array([0.0, 0.0], dtype=np.float32)
+                        vn = np.linalg.norm(vec)
+                        vec = vec / vn if vn > 1e-8 else vec
+                        net_tan.append(vec.astype(np.float32))
+                        net_factor.append(float(fac))
+                        net_half.append(max(float(dist_bank[n[0], n[1]]), 0.5))
+                        branch_segs.append((p[0], p[1], n[0], n[1], float(fac)) if p is not None
+                                           else (n[0], n[1], n[0], n[1], float(fac)))
+
+            # 最大分量：记录主流骨架路径，用于 CSV 与预览
+            if trunk_skel is None:
+                trunk_skel = trunk_path
+
+        self.net_r = np.asarray(net_r, dtype=np.int64)
+        self.net_c = np.asarray(net_c, dtype=np.int64)
+        self.net_tan = np.asarray(net_tan, dtype=np.float32)
+        self.net_factor = np.asarray(net_factor, dtype=np.float32)
+        self.net_half = np.asarray(net_half, dtype=np.float32)
+        print(f"  河网节点: {len(self.net_r):,}（主流 + 分流）")
+
+        # 4. 主流中心线 → CSV（沿用原有平滑/重采样/UE 坐标逻辑）
+        if trunk_skel is not None and len(trunk_skel) >= 2:
+            self._write_centerline(trunk_skel, scale_factor, H, W, branch_segs)
+        print(f"  河网提取耗时 {time.time()-t0:.1f}s")
+
+    def _write_centerline(self, trunk_path, scale_factor, H, W, branch_segs):
+        """将主流骨架路径平滑重采样后写 CSV，并输出河网预览图。"""
+        from scipy.ndimage import gaussian_filter1d
+
+        path_full = [(r / scale_factor, c / scale_factor) for r, c in trunk_path]
         path_arr = np.array(path_full, dtype=float)
         sigma = 3.0
         r_smooth = gaussian_filter1d(path_arr[:, 0], sigma=sigma)
         c_smooth = gaussian_filter1d(path_arr[:, 1], sigma=sigma)
 
-        # 5. 按弧长重采样（默认 500cm UE 间距）
         sample_spacing_cm = 500.0
         sample_spacing_px = sample_spacing_cm / UE_PER_PX10
         diffs = np.diff(np.stack([r_smooth, c_smooth], axis=1), axis=0)
@@ -188,13 +317,8 @@ class WaterFlowBuilder:
         r_sampled = np.interp(sample_arc, arc, r_smooth)
         c_sampled = np.interp(sample_arc, arc, c_smooth)
 
-        # 6. 像素坐标 → UE 世界坐标
-        # 注意：OBJ 在 UE 导入时会做右手系→左手系转换，Y 被翻转；
-        # CSV 直接作为 UE 世界坐标读入，因此用 ue_y_csv_of_row（= -(OBJ 内 y)），
-        # 与 UE 导入 terrain_water.obj 后的 mesh Y 轴（y=+south）保持一致。
         x = ue_x_of_col(c_sampled, W)
         y = ue_y_csv_of_row(r_sampled, H)
-
         r_i = np.clip(np.round(r_sampled).astype(np.int64), 0, H - 1)
         c_i = np.clip(np.round(c_sampled).astype(np.int64), 0, W - 1)
         z = self.dem_10x[r_i, c_i] * UE_SCALE
@@ -203,7 +327,6 @@ class WaterFlowBuilder:
                   for i in range(len(x))]
         self.centerline_points = np.column_stack([x, y, z])
 
-        # 7. 输出 CSV（UE DataTable 格式，结构体含 FVector Position）
         out = Path(self.out_dir)
         out.mkdir(parents=True, exist_ok=True)
         csv_path = out / "terrain_water_centerline.csv"
@@ -214,127 +337,93 @@ class WaterFlowBuilder:
         csv_path.write_text("\n".join(lines), encoding="utf-8")
         print(f"  写入中心线 CSV: {csv_path}")
 
-        # 8. 输出预览图
-        preview = np.zeros((H, W, 3), dtype=np.uint8)
-        # 水体掩膜用淡蓝（BGR：蓝=255，绿=210，红=180）
-        preview[self.water_mask] = [255, 210, 180]
+        # 预览：背景白 + 水体黑 + 主流红 + 分流按因子着色（避免蓝色水体与低因子蓝色混叠）
+        preview = np.full((H, W, 3), 255, dtype=np.uint8)
+        preview[self.water_mask] = [0, 0, 0]
         rr = np.clip(np.round(r_sampled).astype(np.int64), 0, H - 1)
         cc = np.clip(np.round(c_sampled).astype(np.int64), 0, W - 1)
         for i in range(len(rr) - 1):
             cv2.line(preview, (int(cc[i]), int(rr[i])),
-                     (int(cc[i + 1]), int(rr[i + 1])), (0, 0, 255), thickness=3)
+                     (int(cc[i + 1]), int(rr[i + 1])), (0, 0, 255), thickness=10)
+
+        inv = 1.0 / scale_factor
+        for (r1, c1, r2, c2, fac) in branch_segs:
+            color = self._factor_color(fac)
+            cv2.line(preview,
+                     (int(round(c1 * inv)), int(round(r1 * inv))),
+                     (int(round(c2 * inv)), int(round(r2 * inv))),
+                     (int(color[0]), int(color[1]), int(color[2])), thickness=5)
         preview_path = out / "terrain_water_centerline_preview.png"
         cv2.imwrite(str(preview_path), preview)
-        print(f"  写入中心线预览: {preview_path}")
-
-        print(f"  中心线提取耗时 {time.time()-t0:.1f}s")
+        print(f"  写入河网预览: {preview_path}")
 
     # ═══════════════════════════════════════════════════════════════
     # 静态速度场生成
     # ═══════════════════════════════════════════════════════════════
 
     def _generate_velocity_field(self, resolution: int = 2048):
-        """以中心线为主、岸边切线影响、加低频扰动生成水体速度场纹理。
+        """基于河网（主流切向 + 分流衰减）生成水体速度场纹理。
 
         输出通道：
           R：世界空间流向 X 分量（[-1,1] 映射到 [0,1]）
           G：世界空间流向 Y 分量（[-1,1] 映射到 [0,1]）
-          B：速度大小（中心≈1，岸边≈0，叠加轻微噪声）
+          B：速度大小（中心快、岸边慢，分流越远越慢，叠加轻微噪声）
           A：水体掩膜
 
         纹理按 V-up 生成，PNG 顶部存图像底部，与 UE 里水体 mesh UV 方向一致。
         """
-        if self.centerline_points is None or len(self.centerline_points) < 2:
-            print("  中心线缺失，跳过速度场生成")
+        from scipy.spatial import cKDTree
+
+        if self.net_r is None or len(self.net_r) < 2:
+            print("  河网节点缺失，跳过速度场生成")
             return
 
         print("生成水体速度场纹理...")
         t0 = time.time()
-        H, W = self.water_mask.shape
-
-        # 1. 计算速度场分辨率
-        max_side = max(W, H)
-        if max_side <= resolution:
-            res_w, res_h = W, H
-        else:
-            scale = resolution / max_side
-            res_w = int(round(W * scale))
-            res_h = int(round(H * scale))
-        print(f"  速度场分辨率: {res_w}x{res_h}")
-
-        # 2. 水体像素坐标（下采样到目标分辨率）
-        if res_h != H or res_w != W:
-            water_mask_small = cv2.resize(
-                self.water_mask.astype(np.uint8) * 255,
-                (res_w, res_h),
-                interpolation=cv2.INTER_NEAREST,
-            ) > 0
-        else:
-            water_mask_small = self.water_mask
-        water_idx = np.argwhere(water_mask_small)  # (M, 2) [r, c]
+        res_h, res_w = self.water_small.shape
+        water_idx = np.argwhere(self.water_small)  # (M, 2) [r, c]
         if len(water_idx) == 0:
             print("  无水体像素，跳过速度场生成")
             return
 
-        # 3. 中心线切线（在速度场分辨率下）
-        cl = self.centerline_points[:, :2].astype(np.float64)
-        c_cl = cl[:, 0] * PX10_PER_UE + W * 0.5
-        r_cl = cl[:, 1] * PX10_PER_UE + H * 0.5
-        c_cl *= res_w / W
-        r_cl *= res_h / H
-        cl_res = np.column_stack([r_cl, c_cl]).astype(np.float32)
+        net_pts = np.column_stack([self.net_r, self.net_c]).astype(np.float32)
+        net_tree = cKDTree(net_pts)
 
-        tangents = np.empty_like(cl_res)
-        tangents[1:-1] = cl_res[2:] - cl_res[:-2]
-        tangents[0] = cl_res[1] - cl_res[0]
-        tangents[-1] = cl_res[-1] - cl_res[-2]
-        norms = np.linalg.norm(tangents, axis=1, keepdims=True)
-        norms[norms < 1e-8] = 1.0
-        tangents = tangents / norms
+        # 每个水体像素：最近河网节点 → 切向 + 因子 + 半宽
+        dist_net, idx_net = net_tree.query(water_idx.astype(np.float32), k=1)
+        tangent = self.net_tan[idx_net].copy()          # (M, 2)
+        factor = self.net_factor[idx_net]               # (M,)
+        half = np.maximum(self.net_half[idx_net], 0.5)  # (M,)
+        channel_pos = np.clip(dist_net / half, 0.0, 1.0)  # 0=河道中心 1=岸边
 
-        from scipy.spatial import cKDTree
-        cl_tree = cKDTree(cl_res)
-
-        # 4. 平滑岸边切线场（高斯模糊 + Sobel 梯度，垂直方向即为切线）
-        bd_mask_small = ~water_mask_small
-        bd_idx = np.argwhere(bd_mask_small)
+        # 岸边切线场（高斯模糊 + Sobel，垂直梯度方向即切线）
+        bd_idx = np.argwhere(~self.water_small)
         if len(bd_idx) == 0:
             print("  无岸边，跳过速度场生成")
             return
         bd_tree = cKDTree(bd_idx.astype(np.float32))
-
-        blurred = cv2.GaussianBlur(water_mask_small.astype(np.float32), (0, 0), sigmaX=8.0)
+        blurred = cv2.GaussianBlur(self.water_small.astype(np.float32), (0, 0), sigmaX=8.0)
         gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=5)
         gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=5)
         grad_norm = np.sqrt(gx * gx + gy * gy)
         grad_norm[grad_norm < 1e-8] = 1.0
-        # 切线场 (r, c) 方向 = 垂直于梯度
         tangent_r = -gx / grad_norm
         tangent_c = gy / grad_norm
-        bd_tangents = np.column_stack([
+        bd_tan = np.column_stack([
             tangent_r[bd_idx[:, 0], bd_idx[:, 1]],
             tangent_c[bd_idx[:, 0], bd_idx[:, 1]],
         ]).astype(np.float32)
-
-        # 5. 每个水体像素：中心线切线 + 岸边切线加权
-        dist_cl, idx_cl = cl_tree.query(water_idx.astype(np.float32), k=1)
-        direction = tangents[idx_cl].copy()
-
         dist_bd, idx_bd = bd_tree.query(water_idx.astype(np.float32), k=1)
-        bank_tangent = bd_tangents[idx_bd]
-        # 岸边切线可能与中心线反向，统一方向
-        dot = np.sum(direction * bank_tangent, axis=1)
+        bank_tangent = bd_tan[idx_bd]
+        dot = np.sum(tangent * bank_tangent, axis=1)
         bank_tangent[dot < 0] *= -1
 
-        # 岸边影响：离岸边越近影响越大，中心线处影响为 0
-        max_bank_dist = max(dist_bd.max(), 1e-6)
-        bank_influence = 1.0 - np.clip(dist_bd / max_bank_dist, 0.0, 1.0)
-        bank_influence = np.power(bank_influence, 1.5)
-
-        direction = (1.0 - bank_influence[:, None]) * direction + \
+        # 岸边影响：近岸用岸边切向，河道中心用河网切向
+        bank_influence = np.power(channel_pos, 1.5)
+        direction = (1.0 - bank_influence[:, None]) * tangent + \
                     bank_influence[:, None] * bank_tangent
 
-        # 6. 低频 Perlin 噪声扰动方向与速度
+        # 低频 Perlin 噪声扰动方向
         noise = self._perlin_noise(res_h, res_w, octaves=4, base_grid=16, seed=self.velocity_seed)
         noise_vals = noise[water_idx[:, 0], water_idx[:, 1]]
         noise_angle = noise_vals * self.velocity_noise_scale
@@ -349,12 +438,12 @@ class WaterFlowBuilder:
         dnorm[dnorm < 1e-8] = 1.0
         direction = direction / dnorm
 
-        # 7. 速度：中心快、岸边慢，叠加轻微噪声
-        speed = np.clip(dist_bd / max_bank_dist, 0.0, 1.0)
+        # 速度 = 横向廓线(中心快岸边慢) × 分流衰减因子 × 噪声
+        speed = (1.0 - channel_pos) * factor
         speed = speed * (1.0 + 0.2 * noise_vals)
         speed = np.clip(speed, 0.0, 1.0)
 
-        # 8. 组装输出纹理（V-up）
+        # 组装输出纹理（V-up）
         tex = np.zeros((res_h, res_w, 4), dtype=np.float32)
         row_vup = res_h - 1 - water_idx[:, 0]
         tex[row_vup, water_idx[:, 1], 0] = direction[:, 1] * 0.5 + 0.5
@@ -441,11 +530,11 @@ class WaterFlowBuilder:
     # ═══════════════════════════════════════════════════════════════
 
     def build(self):
-        """提取中心线并生成速度场纹理。"""
+        """提取河网并生成速度场纹理。"""
         t0 = time.time()
         self.load()
-        self._extract_centerline()
-        if self.centerline_points is not None:
+        self._extract_network()
+        if self.net_r is not None and len(self.net_r) >= 2:
             self._generate_velocity_field(resolution=self.velocity_res)
         print(f"总耗时: {time.time()-t0:.1f}s")
 
@@ -468,7 +557,7 @@ def test(label_10x_path: str = None, dem_path: str = None, out_dir: str = None):
 
 
 def main():
-    p = argparse.ArgumentParser(description="水体中心线 + 静态速度场生成器")
+    p = argparse.ArgumentParser(description="水体河网 + 分流速度场生成器")
     p.add_argument("--label-10x", default="TestInput/SanHe/Output_10x/labels_10x_no_boundary.tif",
                    help="10x 语义标签路径（水体 = band1 == 0）")
     p.add_argument("--dem", default="TestInput/SanHe/dem.tif", help="DEM 路径")
@@ -476,8 +565,25 @@ def main():
     p.add_argument("--velocity-res", type=int, default=2048, help="速度场纹理最长边像素数")
     p.add_argument("--velocity-seed", type=int, default=42, help="Perlin 噪声随机种子")
     p.add_argument("--velocity-noise", type=float, default=0.15, help="流向噪声强度（弧度）")
+    p.add_argument("--velocity-branch-alpha", type=float, default=0.5,
+                   help="分流速度衰减幂次 α，factor = (1 - d/L)^α")
+    p.add_argument("--velocity-branch-residual", type=float, default=0.1,
+                   help="分流末端残余速度因子（0~1）")
     args = p.parse_args()
-    test(args.label_10x, args.dem, args.out_dir)
+    builder = WaterFlowBuilder(
+        label_10x_path=args.label_10x,
+        dem_path=args.dem,
+        out_dir=args.out_dir,
+        velocity_res=args.velocity_res,
+        velocity_seed=args.velocity_seed,
+        velocity_noise_scale=args.velocity_noise,
+        velocity_branch_alpha=args.velocity_branch_alpha,
+        velocity_branch_residual=args.velocity_branch_residual,
+    )
+    for pth in (builder.label_10x_path, builder.dem_path):
+        if not Path(pth).is_file():
+            raise FileNotFoundError(f"缺少输入: {pth}")
+    builder.build()
 
 
 if __name__ == "__main__":
