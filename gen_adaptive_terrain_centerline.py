@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
 """
-gen_adaptive_terrain_centerline.py -- 自适应分辨率 UE 地形生成器（含水体中心线与速度场）
+gen_adaptive_terrain_centerline.py — 自适应分辨率 UE 地形生成器 + 全管线编排入口
 
-本文件是完整管线的唯一入口（main），负责：
-  1. 语义分类（classify_vecw.py）
-  2. 标签后处理（label_postprocess.py）
-  3. 简化 3DGS 语义地图（gen_semantic.py）
-  4. 自适应分辨率地形 OBJ 生成（本文件 AdaptiveTerrainBuilder）
-  5. 水体中心线提取与静态速度场纹理生成（_extract_centerline / _generate_velocity_field）
+职责划分：
+  1. 全管线编排入口（main）：分类 → 后处理 → 三路并行
+     （3DGS 语义地图 gen_semantic / 地形 OBJ 本文件 / 水体流场 gen_water_flow）
+  2. 地形构建 AdaptiveTerrainBuilder：从 10x 标签 + 边界线 + DEM 生成
+     terrain_ground.obj / terrain_water.obj / terrain_building.obj
 
-classify_vecw / label_postprocess / gen_semantic 三个模块也可通过各自的 main() 独立运行。
+水体中心线（CSV）与静态速度场纹理已独立为 gen_water_flow.py（WaterFlowBuilder），
+与地形 OBJ 无数据依赖，二者在并行阶段同时执行。坐标常量统一见 map_common.py。
+
+classify_vecw / label_postprocess / gen_semantic / gen_water_flow
+均可通过各自的 main() 独立运行。
 """
 
 import argparse
+import os
+import queue
+import re
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 import rasterio
 import cv2
-import networkx as nx
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import Delaunay
 
 # 添加脚本目录到导入路径，确保 standalone 运行能找到同级模块
 sys.path.insert(0, str(Path(__file__).parent))
 from classify_vecw import VecClassifier
-from gen_semantic import SemanticMapBuilder
 from label_postprocess import LabelPostprocessor
+from map_common import PX_M, SCALE, UE_SCALE
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -36,14 +43,11 @@ from label_postprocess import LabelPostprocessor
 # ═══════════════════════════════════════════════════════════════
 
 COARSE_STRIDE_ORIG = 10          # 粗网格在原始像素下的 stride
-SCALE = 10                       # 10x 上采样倍数
 BOUNDARY_SAMPLE_STEP = 1         # 沿边界线采样步长（10x 像素）
 
 WATER_DEPTH = 7.5                # 水体最大深度（米）
 WATER_EDGE_WIDTH = 12.0          # 水边过渡宽度（米）
 BUILDING_BUFFER_DEPTH = 0.01     # 建筑裙边最大下沉深度（米）
-PX_M = 0.458                     # 原始像素地面尺寸（米）
-UE_SCALE = 100.0                 # UE 单位缩放
 
 MAT_NAMES = ["M_Ground", "M_Road", "M_WaterBed", "M_Building"]
 MAT_COLORS = [
@@ -79,7 +83,7 @@ def class_to_mat(class_ids):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 自适应地形构建器
+# 自适应地形构建器（仅地形网格；水体流场见 gen_water_flow.py）
 # ═══════════════════════════════════════════════════════════════
 
 class AdaptiveTerrainBuilder:
@@ -91,8 +95,8 @@ class AdaptiveTerrainBuilder:
       - terrain_water.obj：蓝色水面盖子
     三个 OBJ 同坐标系，UE 000 对齐。
 
-    此外基于水体掩膜提取河流中心线（CSV + 预览图），
-    并生成水体静态速度场纹理（流向 R/G + 速度 B + 掩膜 A，供 UE 水体扩散模拟采样）。
+    坐标常量（PX_M / SCALE / UE_SCALE）来自 map_common.py，
+    与 gen_water_flow.py 的中心线 CSV / 速度场保持一致。
     """
 
     def __init__(
@@ -119,16 +123,6 @@ class AdaptiveTerrainBuilder:
         self.water_edge_width = water_edge_width
         self.building_buffer_depth = building_buffer_depth
         self.ue_scale = ue_scale
-        # 速度场相关参数。
-        # 注意：velocity_bank_weight / velocity_bank_falloff / velocity_profile_power
-        # 为预留参数（CLI 已暴露），当前 _generate_velocity_field 内部使用硬编码值，
-        # 尚未接入算法，调整对应 CLI 参数不会生效。
-        self.velocity_res = 2048
-        self.velocity_seed = 42
-        self.velocity_noise_scale = 0.15
-        self.velocity_bank_weight = 0.35
-        self.velocity_bank_falloff = 8.0
-        self.velocity_profile_power = 1.5
 
         self.H10 = self.W10 = 0
         self.class_10x = None
@@ -148,7 +142,6 @@ class AdaptiveTerrainBuilder:
         self.water_faces = []      # 水面 OBJ 面
         self.building_verts = []   # 建筑 OBJ 顶点
         self.building_faces = []   # 建筑 OBJ 面
-        self.centerline_points = None  # 中心线世界坐标（N, 3）
 
     # ═══════════════════════════════════════════════════════════════
     # 加载与预处理
@@ -387,346 +380,6 @@ class AdaptiveTerrainBuilder:
         print(f"  耗时 {time.time()-t0:.1f}s")
 
     # ═══════════════════════════════════════════════════════════════
-    # 水体中心线提取
-    # ═══════════════════════════════════════════════════════════════
-
-    def _extract_centerline(self):
-        """从 water_mask 提取河流中心线，输出 CSV 与预览图。"""
-        from skimage.morphology import skeletonize
-        from scipy.ndimage import gaussian_filter1d
-
-        if self.water_mask is None or not np.any(self.water_mask):
-            print("  无水体，跳过中心线提取")
-            return
-
-        print("提取水体中心线...")
-        t0 = time.time()
-        H, W = self.water_mask.shape
-
-        # 1. 下采样后骨架化（避免大分辨率全图骨架化卡死）
-        target_skeleton_size = 2048
-        max_side = max(H, W)
-        scale_factor = target_skeleton_size / max_side
-        if scale_factor >= 1.0:
-            water_small = self.water_mask
-            scale_factor = 1.0
-        else:
-            H_small = int(H * scale_factor)
-            W_small = int(W * scale_factor)
-            water_small = cv2.resize(
-                self.water_mask.astype(np.uint8) * 255,
-                (W_small, H_small),
-                interpolation=cv2.INTER_NEAREST
-            ) > 0
-
-        skel = skeletonize(water_small)
-        if not np.any(skel):
-            print("  骨架为空，跳过")
-            return
-
-        # 2. 8-邻接建图
-        Hs, Ws = water_small.shape
-        G = nx.Graph()
-        for r, c in zip(*np.where(skel)):
-            node = (int(r), int(c))
-            G.add_node(node)
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
-                           (-1, -1), (-1, 1), (1, -1), (1, 1)]:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < Hs and 0 <= nc < Ws and skel[nr, nc]:
-                    G.add_edge(node, (int(nr), int(nc)))
-
-        if G.number_of_nodes() == 0:
-            print("  骨架图为空，跳过")
-            return
-
-        # 3. 取最大连通分量并找直径（两次 BFS）
-        components = list(nx.connected_components(G))
-        largest = max(components, key=len)
-        G_main = G.subgraph(largest).copy()
-
-        def bfs_farthest(start):
-            lengths = nx.single_source_shortest_path_length(G_main, start)
-            far_node = max(lengths, key=lengths.get)
-            return far_node, lengths
-
-        start = next(iter(G_main.nodes))
-        A, _ = bfs_farthest(start)
-        B, _ = bfs_farthest(A)
-        path = nx.shortest_path(G_main, A, B)
-
-        # 4. 映射回原始分辨率并平滑
-        path_full = [(r / scale_factor, c / scale_factor) for r, c in path]
-        path_arr = np.array(path_full, dtype=float)
-        sigma = 3.0
-        r_smooth = gaussian_filter1d(path_arr[:, 0], sigma=sigma)
-        c_smooth = gaussian_filter1d(path_arr[:, 1], sigma=sigma)
-
-        # 5. 按弧长重采样（默认 500cm UE 间距）
-        sample_spacing_cm = 500.0
-        sample_spacing_px = sample_spacing_cm / ((PX_M / SCALE) * UE_SCALE)
-        diffs = np.diff(np.stack([r_smooth, c_smooth], axis=1), axis=0)
-        arc = np.cumsum(np.linalg.norm(diffs, axis=1))
-        arc = np.insert(arc, 0, 0.0)
-        total_arc = arc[-1]
-        n_samples = max(2, int(np.ceil(total_arc / sample_spacing_px)) + 1)
-        sample_arc = np.linspace(0.0, total_arc, n_samples)
-
-        r_sampled = np.interp(sample_arc, arc, r_smooth)
-        c_sampled = np.interp(sample_arc, arc, c_smooth)
-
-        # 6. 像素坐标 → UE 世界坐标
-        # 注意：OBJ 在 UE 导入时会做右手系→左手系转换，Y 被翻转。
-        # CSV 直接作为 UE 世界坐标读入。OBJ 导出为右手系 Z-up（Y=-north），
-        # UE 导入后翻为左手系（Y=+south），所以 CSV 的 Y 应与 UE 中 mesh 一致：
-        # Y_ue = +r*scale - H/2*scale。
-        x = (c_sampled / SCALE) * PX_M * self.ue_scale
-        y = ((r_sampled / SCALE) * PX_M * self.ue_scale)
-        x -= (W / SCALE) * PX_M * self.ue_scale * 0.5
-        y -= (H / SCALE) * PX_M * self.ue_scale * 0.5
-
-        r_i = np.clip(np.round(r_sampled).astype(np.int64), 0, H - 1)
-        c_i = np.clip(np.round(c_sampled).astype(np.int64), 0, W - 1)
-        z = self.dem_10x[r_i, c_i] * self.ue_scale
-
-        points = [{"x": float(x[i]), "y": float(y[i]), "z": float(z[i])}
-                  for i in range(len(x))]
-        self.centerline_points = np.column_stack([x, y, z])
-
-        # 7. 输出 CSV（UE DataTable 格式，结构体含 FVector Position）
-        out = Path(self.out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        csv_path = out / "terrain_water_centerline.csv"
-        lines = ["---,Position"]
-        for i, p in enumerate(points):
-            pos = f"\"(X={p['x']:.6f},Y={p['y']:.6f},Z={p['z']:.6f})\""
-            lines.append(f"Point{i},{pos}")
-        csv_path.write_text("\n".join(lines), encoding="utf-8")
-        print(f"  写入中心线 CSV: {csv_path}")
-
-        # 8. 输出预览图（不覆盖原有水体掩膜输出）
-        preview = np.zeros((H, W, 3), dtype=np.uint8)
-        # 水体掩膜用淡蓝（BGR：蓝=255，绿=210，红=180）
-        preview[self.water_mask] = [255, 210, 180]
-        rr = np.clip(np.round(r_sampled).astype(np.int64), 0, H - 1)
-        cc = np.clip(np.round(c_sampled).astype(np.int64), 0, W - 1)
-        for i in range(len(rr) - 1):
-            cv2.line(preview, (int(cc[i]), int(rr[i])),
-                     (int(cc[i + 1]), int(rr[i + 1])), (0, 0, 255), thickness=3)
-        preview_path = out / "terrain_water_centerline_preview.png"
-        cv2.imwrite(str(preview_path), preview)
-        print(f"  写入中心线预览: {preview_path}")
-
-        print(f"  中心线提取耗时 {time.time()-t0:.1f}s")
-
-    def _generate_velocity_field(self, resolution: int = 2048):
-        """以中心线为主、岸边切线影响、加低频扰动生成水体速度场纹理。
-
-        输出通道：
-          R：世界空间流向 X 分量（[-1,1] 映射到 [0,1]）
-          G：世界空间流向 Y 分量（[-1,1] 映射到 [0,1]）
-          B：速度大小（中心≈1，岸边≈0，叠加轻微噪声）
-          A：水体掩膜
-
-        纹理按 V-up 生成，PNG 顶部存图像底部，与 UE 里水体 mesh UV 方向一致。
-        """
-        if self.centerline_points is None or len(self.centerline_points) < 2:
-            print("  中心线缺失，跳过速度场生成")
-            return
-        if not self.water_verts:
-            print("  水面网格为空，跳过速度场生成")
-            return
-
-        print("生成水体速度场纹理...")
-        t0 = time.time()
-        H, W = self.water_mask.shape
-
-        # 1. 计算速度场分辨率
-        max_side = max(W, H)
-        if max_side <= resolution:
-            res_w, res_h = W, H
-        else:
-            scale = resolution / max_side
-            res_w = int(round(W * scale))
-            res_h = int(round(H * scale))
-        print(f"  速度场分辨率: {res_w}x{res_h}")
-
-        # 2. 水体像素坐标（下采样到目标分辨率）
-        if res_h != H or res_w != W:
-            water_mask_small = cv2.resize(
-                self.water_mask.astype(np.uint8) * 255,
-                (res_w, res_h),
-                interpolation=cv2.INTER_NEAREST,
-            ) > 0
-        else:
-            water_mask_small = self.water_mask
-        water_idx = np.argwhere(water_mask_small)  # (M, 2) [r, c]
-        if len(water_idx) == 0:
-            print("  无水体像素，跳过速度场生成")
-            return
-
-        # 3. 中心线切线（在速度场分辨率下）
-        scale_xy = PX_M * self.ue_scale / SCALE
-        cl = self.centerline_points[:, :2].astype(np.float64)
-        c_cl = cl[:, 0] / scale_xy + W * 0.5
-        r_cl = cl[:, 1] / scale_xy + H * 0.5
-        c_cl *= res_w / W
-        r_cl *= res_h / H
-        cl_res = np.column_stack([r_cl, c_cl]).astype(np.float32)
-
-        tangents = np.empty_like(cl_res)
-        tangents[1:-1] = cl_res[2:] - cl_res[:-2]
-        tangents[0] = cl_res[1] - cl_res[0]
-        tangents[-1] = cl_res[-1] - cl_res[-2]
-        norms = np.linalg.norm(tangents, axis=1, keepdims=True)
-        norms[norms < 1e-8] = 1.0
-        tangents = tangents / norms
-
-        from scipy.spatial import cKDTree
-        cl_tree = cKDTree(cl_res)
-
-        # 4. 平滑岸边切线场（高斯模糊 + Sobel 梯度，垂直方向即为切线）
-        bd_mask_small = ~water_mask_small
-        bd_idx = np.argwhere(bd_mask_small)
-        if len(bd_idx) == 0:
-            print("  无岸边，跳过速度场生成")
-            return
-        bd_tree = cKDTree(bd_idx.astype(np.float32))
-
-        blurred = cv2.GaussianBlur(water_mask_small.astype(np.float32), (0, 0), sigmaX=8.0)
-        gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=5)
-        gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=5)
-        grad_norm = np.sqrt(gx * gx + gy * gy)
-        grad_norm[grad_norm < 1e-8] = 1.0
-        # 切线场 (r, c) 方向 = 垂直于梯度
-        tangent_r = -gx / grad_norm
-        tangent_c = gy / grad_norm
-        bd_tangents = np.column_stack([
-            tangent_r[bd_idx[:, 0], bd_idx[:, 1]],
-            tangent_c[bd_idx[:, 0], bd_idx[:, 1]],
-        ]).astype(np.float32)
-
-        # 5. 每个水体像素：中心线切线 + 岸边切线加权
-        dist_cl, idx_cl = cl_tree.query(water_idx.astype(np.float32), k=1)
-        direction = tangents[idx_cl].copy()
-
-        dist_bd, idx_bd = bd_tree.query(water_idx.astype(np.float32), k=1)
-        bank_tangent = bd_tangents[idx_bd]
-        # 岸边切线可能与中心线反向，统一方向
-        dot = np.sum(direction * bank_tangent, axis=1)
-        bank_tangent[dot < 0] *= -1
-
-        # 岸边影响：离岸边越近影响越大，中心线处影响为 0
-        max_bank_dist = max(dist_bd.max(), 1e-6)
-        bank_influence = 1.0 - np.clip(dist_bd / max_bank_dist, 0.0, 1.0)
-        bank_influence = np.power(bank_influence, 1.5)
-
-        direction = (1.0 - bank_influence[:, None]) * direction + \
-                    bank_influence[:, None] * bank_tangent
-
-        # 6. 低频 Perlin 噪声扰动方向与速度
-        noise = self._perlin_noise(res_h, res_w, octaves=4, base_grid=16, seed=self.velocity_seed)
-        noise_vals = noise[water_idx[:, 0], water_idx[:, 1]]
-        noise_angle = noise_vals * self.velocity_noise_scale
-        cos_a = np.cos(noise_angle)
-        sin_a = np.sin(noise_angle)
-        rot_dir = np.empty_like(direction)
-        rot_dir[:, 0] = direction[:, 0] * cos_a - direction[:, 1] * sin_a
-        rot_dir[:, 1] = direction[:, 0] * sin_a + direction[:, 1] * cos_a
-        direction = rot_dir
-
-        dnorm = np.linalg.norm(direction, axis=1, keepdims=True)
-        dnorm[dnorm < 1e-8] = 1.0
-        direction = direction / dnorm
-
-        # 7. 速度：中心快、岸边慢，叠加轻微噪声
-        speed = np.clip(dist_bd / max_bank_dist, 0.0, 1.0)
-        speed = speed * (1.0 + 0.2 * noise_vals)
-        speed = np.clip(speed, 0.0, 1.0)
-
-        # 8. 组装输出纹理（V-up）
-        tex = np.zeros((res_h, res_w, 4), dtype=np.float32)
-        row_vup = res_h - 1 - water_idx[:, 0]
-        tex[row_vup, water_idx[:, 1], 0] = direction[:, 1] * 0.5 + 0.5
-        tex[row_vup, water_idx[:, 1], 1] = direction[:, 0] * 0.5 + 0.5
-        tex[row_vup, water_idx[:, 1], 2] = speed
-        tex[row_vup, water_idx[:, 1], 3] = 1.0
-
-        out = Path(self.out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        vel_path = out / "terrain_velocity_field.png"
-        vel_uint8 = np.clip(tex * 255.0, 0, 255).astype(np.uint8)
-        cv2.imwrite(str(vel_path), cv2.cvtColor(vel_uint8, cv2.COLOR_RGBA2BGRA))
-        print(f"  写入速度场纹理: {vel_path}")
-
-        preview = self._velocity_preview(direction, speed, water_idx, res_h, res_w)
-        preview_path = out / "terrain_velocity_field_preview.png"
-        cv2.imwrite(str(preview_path), preview)
-        print(f"  写入速度场预览: {preview_path}")
-
-        print(f"  速度场生成耗时 {time.time()-t0:.1f}s")
-
-    @staticmethod
-    def _perlin_noise(h, w, octaves=4, base_grid=16, seed=42):
-        """标准低频分形 Perlin 噪声，输出范围约 [-1, 1]。"""
-        rng = np.random.default_rng(seed)
-
-        def perlin_layer(gh, gw):
-            angles = rng.random((gh, gw), dtype=np.float32) * 2.0 * np.pi
-            grad_y, grad_x = np.cos(angles), np.sin(angles)
-
-            xs = np.linspace(0.0, gw - 1.0, w, endpoint=False, dtype=np.float32)
-            ys = np.linspace(0.0, gh - 1.0, h, endpoint=False, dtype=np.float32)
-            xv, yv = np.meshgrid(xs, ys, indexing='xy')
-
-            x0 = np.floor(xv).astype(np.int32)
-            y0 = np.floor(yv).astype(np.int32)
-            xf = xv - x0.astype(np.float32)
-            yf = yv - y0.astype(np.float32)
-
-            u = xf * xf * (3.0 - 2.0 * xf)
-            v = yf * yf * (3.0 - 2.0 * yf)
-
-            x1 = np.clip(x0 + 1, 0, gw - 1)
-            y1 = np.clip(y0 + 1, 0, gh - 1)
-            x0 = np.clip(x0, 0, gw - 1)
-            y0 = np.clip(y0, 0, gh - 1)
-
-            n00 = grad_x[y0, x0] * xf + grad_y[y0, x0] * yf
-            n01 = grad_x[y0, x1] * (xf - 1.0) + grad_y[y0, x1] * yf
-            n10 = grad_x[y1, x0] * xf + grad_y[y1, x0] * (yf - 1.0)
-            n11 = grad_x[y1, x1] * (xf - 1.0) + grad_y[y1, x1] * (yf - 1.0)
-
-            nx0 = n00 + (n01 - n00) * u
-            nx1 = n10 + (n11 - n10) * u
-            return nx0 + (nx1 - nx0) * v
-
-        noise = np.zeros((h, w), dtype=np.float32)
-        freq, amp, total = 1.0, 1.0, 0.0
-        for _ in range(octaves):
-            gh = max(2, int(round(base_grid * freq)))
-            gw = max(2, int(round(base_grid * freq)))
-            noise += perlin_layer(gh, gw) * amp
-            total += amp
-            freq *= 2.0
-            amp *= 0.5
-
-        return noise / total
-
-    @staticmethod
-    def _velocity_preview(direction, profile, water_idx, h, w):
-        """HSV 流向预览：色相=方向，亮度=速度（V-up 布局，与 UE 纹理一致）。"""
-        angle = np.arctan2(direction[:, 0], direction[:, 1])
-        hue = ((angle + np.pi) / (2.0 * np.pi) * 180).astype(np.uint8)
-        val = (profile * 255).astype(np.uint8)
-        hsv = np.zeros((h, w, 3), dtype=np.uint8)
-        row_vup = h - 1 - water_idx[:, 0]
-        hsv[row_vup, water_idx[:, 1], 0] = hue
-        hsv[row_vup, water_idx[:, 1], 1] = 255
-        hsv[row_vup, water_idx[:, 1], 2] = val
-        return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-    # ═══════════════════════════════════════════════════════════════
     # 法线与导出
     # ═══════════════════════════════════════════════════════════════
 
@@ -814,98 +467,277 @@ class AdaptiveTerrainBuilder:
                         BUILDING_MAT_NAMES, BUILDING_MAT_COLORS)
 
     def build(self):
-        """完整构建流程。"""
+        """完整地形构建流程。"""
         t0 = time.time()
         self.load()
         self.build_delaunay()
         self.build_mesh()
-        self._extract_centerline()
-        self._generate_velocity_field(resolution=self.velocity_res)
         self.export()
         print(f"总耗时: {time.time()-t0:.1f}s")
 
 
 # ═══════════════════════════════════════════════════════════════
-# 完整管线入口（唯一 main）
+# 编排辅助
 # ═══════════════════════════════════════════════════════════════
 
+def _check_centerline_water_align(obj_path: Path, csv_path: Path, tol: float = 1.0):
+    """校验中心线 CSV 是否落在 terrain_water.obj 顶点 AABB 内（防坐标漂移）。
+
+    OBJ 文件内为右手系 y=-north；UE 导入后 y 翻转为 +south，中心线 CSV
+    直接以 UE 世界坐标读入，因此 CSV 的 y 应对应 OBJ y 的取反区间。
+    通过返回 True；任一文件缺失则跳过并返回 True。
+    """
+    if not obj_path.exists() or not csv_path.exists():
+        print("坐标对齐校验: 跳过（缺少 terrain_water.obj 或中心线 CSV）")
+        return True
+
+    verts = []
+    with open(obj_path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("v "):
+                parts = line.split()
+                if len(parts) >= 4:
+                    verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+    if not verts:
+        print("坐标对齐校验: 失败（terrain_water.obj 无顶点）")
+        return False
+    arr = np.array(verts)
+    vx_min, vx_max = arr[:, 0].min(), arr[:, 0].max()
+    vy_min, vy_max = arr[:, 1].min(), arr[:, 1].max()
+    vz_min, vz_max = arr[:, 2].min(), arr[:, 2].max()
+    # OBJ y=-north → UE y=+south 区间为 [-vy_max, -vy_min]
+    south_lo, south_hi = -vy_max, -vy_min
+
+    pat = re.compile(r"\(X=([-\d.]+),Y=([-\d.]+),Z=([-\d.]+)\)")
+    pts = []
+    with open(csv_path, encoding="utf-8") as f:
+        for line in f:
+            m = pat.search(line)
+            if m:
+                pts.append((float(m.group(1)), float(m.group(2)), float(m.group(3))))
+    if not pts:
+        print("坐标对齐校验: 失败（中心线 CSV 无有效点）")
+        return False
+
+    def inside(v, lo, hi):
+        return lo - tol <= v <= hi + tol
+
+    bad = [(x, y, z) for (x, y, z) in pts
+           if not (inside(x, vx_min, vx_max) and inside(y, south_lo, south_hi)
+                   and inside(z, vz_min, vz_max))]
+    if not bad:
+        print(f"坐标对齐校验: 通过（{len(pts)} 个中心线点均在 water OBJ AABB 内）")
+        return True
+    print(f"坐标对齐校验: 失败（{len(bad)}/{len(pts)} 个中心线点超出 water OBJ AABB，示例: {bad[:3]}）")
+    return False
+
+
+def _stream_job(name, argv, log_path, q):
+    """启动一个子进程任务，实时转发其输出（带前缀），结束后回报结果。"""
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+        )
+    except Exception as e:  # 启动失败也走失败通道，不中断其它任务
+        print(f"[{name}] 启动失败: {e}")
+        q.put((name, 1, str(log_path)))
+        return
+
+    try:
+        with open(log_path, "w", encoding="utf-8") as log:
+            for line in proc.stdout:
+                log.write(line)
+                print(f"[{name}] {line}", end="", flush=True)
+    finally:
+        rc = proc.wait()
+
+    q.put((name, rc, str(log_path)))
+    if rc == 0:
+        print(f"[{name}] 完成（退出码 0）")
+    else:
+        print(f"[{name}] 失败（退出码 {rc}），完整输出见日志: {log_path}")
+
+
+def run_terrain_stage(label_10x_path, boundary_path, dem_path, out_dir, boundary_step):
+    """独立运行地形构建（供 --stage-terrain 与并行编排调用）。"""
+    print("=" * 60)
+    print("地形 OBJ 构建（AdaptiveTerrainBuilder）")
+    print("=" * 60)
+    builder = AdaptiveTerrainBuilder(
+        label_10x_path=label_10x_path,
+        boundary_path=boundary_path,
+        dem_path=dem_path,
+        out_dir=out_dir,
+        boundary_sample_step=boundary_step,
+    )
+    builder.build()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 完整管线入口（编排）
+# ═══════════════════════════════════════════════════════════════
+
+def _parse_regenerate(values):
+    """解析 --regenerate 列表（支持逗号分隔与重复指定）。"""
+    allowed = {"classify", "postprocess", "semantic", "terrain", "flow"}
+    parts = []
+    for v in values or []:
+        parts.extend(x.strip() for x in v.split(",") if x.strip())
+    for x in parts:
+        if x not in allowed:
+            raise SystemExit(f"--regenerate 取值无效: {x}（可选: {', '.join(sorted(allowed))}）")
+    return list(dict.fromkeys(parts))  # 去重保序
+
+
 def main():
-    """完整流程入口：分类 → 后处理 → 3DGS语义地图 → 自适应地形OBJ。"""
-    p = argparse.ArgumentParser(description="3DMapRebuilder 自适应地形生成器")
+    p = argparse.ArgumentParser(description="3DMapRebuilder 全管线编排 + 自适应地形生成器")
     p.add_argument("--label-dir", default="TestInput/SanHe", help="labels.tif 所在目录")
     p.add_argument("--dem", default="TestInput/SanHe/dem.tif", help="DEM 路径")
-    p.add_argument("--out-dir", default="output/terrain_adaptive", help="地形 OBJ 输出目录")
-    p.add_argument("--boundary-step", type=int, default=BOUNDARY_SAMPLE_STEP, help="边界采样步长")
+    p.add_argument("--out-dir", default="output/terrain_adaptive", help="地形/流场输出目录")
+    p.add_argument("--boundary-step", type=int, default=BOUNDARY_SAMPLE_STEP, help="边界采样步长（10x 像素）")
     p.add_argument("--velocity-res", type=int, default=2048, help="速度场纹理最长边像素数")
     p.add_argument("--velocity-seed", type=int, default=42, help="Perlin 噪声随机种子")
     p.add_argument("--velocity-noise", type=float, default=0.15, help="流向噪声强度（弧度）")
-    p.add_argument("--velocity-bank-weight", type=float, default=0.35, help="岸边切线加权强度")
-    p.add_argument("--velocity-bank-falloff", type=float, default=8.0, help="岸边切线影响距离衰减（像素）")
-    p.add_argument("--velocity-profile-power", type=float, default=1.5, help="速度廓线幂次")
     p.add_argument("--force", action="store_true",
-                   help="强制重新生成所有中间文件；默认会利用已有文件")
+                   help="强制重新生成所有产物（含已有中间文件）")
+    p.add_argument("--regenerate", action="append", default=[],
+                   help="只强制重新生成指定部分（classify/postprocess/semantic/terrain/flow，"
+                        "可重复指定或以逗号分隔，如 --regenerate terrain,flow）；"
+                        "其余部分仍按缓存逻辑（产物存在则跳过）")
+    p.add_argument("--stage-terrain", action="store_true",
+                   help=argparse.SUPPRESS)  # 内部编排用：只跑地形构建
     args = p.parse_args()
+    regen = _parse_regenerate(args.regenerate)
+    force = args.force
 
     label_dir = Path(args.label_dir)
-    label_path = str(label_dir / "labels.tif")
-    out_10x = str(label_dir / "Output_10x")
-    label_10x_path = str(label_dir / "Output_10x" / "labels_10x_no_boundary.tif")
-    boundary_path = str(label_dir / "Output_10x" / "boundary_lines_10x.png")
-    semantic_ply = str(label_dir / "semanticMap.ply")
+    dem_path = str(Path(args.dem))
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = out_dir / "_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-    vec_path = str(label_dir / "vec_raw.png")
-    sate_path = str(label_dir / "satellite.tif")
+    label_10x_path = label_dir / "Output_10x" / "labels_10x_no_boundary.tif"
+    boundary_path = label_dir / "Output_10x" / "boundary_lines_10x.png"
+    out_10x = label_dir / "Output_10x"
 
-    # 1. 语义分类
-    if not args.force and Path(label_path).exists():
+    # 仅地形模式（供并行编排内部调用）：不触发分类/后处理/并行编排
+    if args.stage_terrain:
+        run_terrain_stage(
+            str(label_10x_path), str(boundary_path), dem_path,
+            str(out_dir), args.boundary_step,
+        )
+        return
+
+    label_path = label_dir / "labels.tif"
+    semantic_ply = label_dir / "semanticMap.ply"
+    obj_paths = [out_dir / "terrain_ground.obj", out_dir / "terrain_water.obj",
+                 out_dir / "terrain_building.obj"]
+    flow_paths = [out_dir / "terrain_water_centerline.csv",
+                  out_dir / "terrain_velocity_field.png"]
+
+    def force_part(part):
+        return force or part in regen
+
+    # ── 1. 语义分类 ──
+    if not force_part("classify") and label_path.exists():
         print(f"使用已有: {label_path}")
     else:
         print("=" * 60)
-        print("Stage 1/4: 语义分类")
+        print("阶段 1: 语义分类（classify_vecw）")
         print("=" * 60)
         clf = VecClassifier()
-        clf.set_input(vec_path, sate_path)
+        clf.set_input(str(label_dir / "vec_raw.png"), str(label_dir / "satellite.tif"))
         clf.set_output(str(label_dir))
         clf.run()
 
-    # 2. 标签后处理
-    if not args.force and Path(label_10x_path).exists() and Path(boundary_path).exists():
+    # ── 2. 标签后处理 ──
+    if not force_part("postprocess") and label_10x_path.exists() and boundary_path.exists():
         print(f"使用已有: {label_10x_path}, {boundary_path}")
     else:
         print("=" * 60)
-        print("Stage 2/4: 标签后处理")
+        print("阶段 2: 标签后处理（label_postprocess）")
         print("=" * 60)
-        pp = LabelPostprocessor(input_path=label_path, output_dir=out_10x)
+        pp = LabelPostprocessor(input_path=str(label_path), output_dir=str(out_10x))
         pp.process()
 
-    # 3. 简化 3DGS 语义地图
-    if not args.force and Path(semantic_ply).exists():
+    # ── 3. 三路并行：3DGS 语义地图 / 地形 OBJ / 水体流场 ──
+    jobs = []
+    if not force_part("semantic") and semantic_ply.exists():
         print(f"使用已有: {semantic_ply}")
     else:
-        print("=" * 60)
-        print("Stage 3/4: 简化 3DGS 语义地图")
-        print("=" * 60)
-        builder = SemanticMapBuilder(label_path=label_path, dem_path=args.dem, out_path=semantic_ply)
-        builder.build()
+        jobs.append((
+            "semantic",
+            [sys.executable, str(Path(__file__).parent / "gen_semantic.py"),
+             "--label", str(label_path), "--dem", dem_path, "--out", str(semantic_ply)],
+        ))
+    if not force_part("terrain") and all(p.exists() for p in obj_paths):
+        print(f"使用已有: 地形 OBJ（{out_dir}）")
+    else:
+        jobs.append((
+            "terrain",
+            [sys.executable, str(Path(__file__).resolve()),
+             "--stage-terrain", "--label-dir", str(label_dir),
+             "--dem", dem_path, "--out-dir", str(out_dir),
+             "--boundary-step", str(args.boundary_step)],
+        ))
+    if not force_part("flow") and all(p.exists() for p in flow_paths):
+        print(f"使用已有: 中心线 CSV + 速度场纹理（{out_dir}）")
+    else:
+        jobs.append((
+            "flow",
+            [sys.executable, str(Path(__file__).parent / "gen_water_flow.py"),
+             "--label-10x", str(label_10x_path), "--dem", dem_path,
+             "--out-dir", str(out_dir),
+             "--velocity-res", str(args.velocity_res),
+             "--velocity-seed", str(args.velocity_seed),
+             "--velocity-noise", str(args.velocity_noise)],
+        ))
 
-    # 4. 自适应地形 OBJ
-    print("=" * 60)
-    print("Stage 4/4: 自适应地形 OBJ")
-    print("=" * 60)
-    terrain_builder = AdaptiveTerrainBuilder(
-        label_10x_path=label_10x_path,
-        boundary_path=boundary_path,
-        dem_path=args.dem,
-        out_dir=args.out_dir,
-        boundary_sample_step=args.boundary_step,
-    )
-    terrain_builder.velocity_res = args.velocity_res
-    terrain_builder.velocity_seed = args.velocity_seed
-    terrain_builder.velocity_noise_scale = args.velocity_noise
-    terrain_builder.velocity_bank_weight = args.velocity_bank_weight
-    terrain_builder.velocity_bank_falloff = args.velocity_bank_falloff
-    terrain_builder.velocity_profile_power = args.velocity_profile_power
-    terrain_builder.build()
+    failed = []
+    if jobs:
+        print("=" * 60)
+        print("并行阶段: " + " / ".join(job[0] for job in jobs))
+        print("（各任务独立运行，单个失败不影响其它任务继续）")
+        print("=" * 60)
+        q = queue.Queue()
+        threads = []
+        for name, argv in jobs:
+            t = threading.Thread(
+                target=_stream_job, args=(name, argv, log_dir / f"{name}.log", q),
+                daemon=True,
+            )
+            threads.append(t)
+            t.start()
+        results = [q.get() for _ in threads]
+        for t in threads:
+            t.join()
+        failed = [(n, rc, lp) for (n, rc, lp) in results if rc != 0]
+        print("=" * 60)
+        print(f"并行阶段结束: {len(results) - len(failed)}/{len(results)} 成功")
+        for n, rc, lp in failed:
+            print(f"  [{n}] 失败（退出码 {rc}），日志: {lp}")
+    else:
+        print("所有产物均已存在，无需执行并行阶段")
+
+    # ── 4. 坐标对齐校验（中心线 CSV vs 水面 OBJ）──
+    align_ok = _check_centerline_water_align(out_dir / "terrain_water.obj",
+                                             out_dir / "terrain_water_centerline.csv")
+
+    exit_code = 1 if (failed or not align_ok) else 0
+    if exit_code == 0:
+        print(f"全部完成，输出目录: {out_dir}")
+    sys.exit(exit_code)
 
 
 def test():
