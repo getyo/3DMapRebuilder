@@ -1,6 +1,8 @@
 # 3DMapRebuilder
 
-从对齐的天地图卫星影像、天地图矢量底图和高程数据生成供 UE 使用的自适应分辨率地形 OBJ 与水体流场数据；另保留独立的 3DGS 语义地图生成脚本（`gen_semantic.py`，不在主管线内）。
+本项目已打通单区域地图从语义分类、标签后处理、自适应地形与水体流场生成，到独立建筑细节制作、UE 地图展示与水体扩散的完整演示流程。**当前尚待支持的是多区域地图**；建筑细节是地图生成链中的独立阶段，由用户在同级目录的 [`SanHe_Building_Module_Standalone`](https://github.com/getyo/SanHe_Building_Module_Standalone) 手动启动，位于地形产物之后、UE 导入之前，不属于本仓库的一键脚本。它读取同一轮的 Building 地形、Ground 上下文、建筑 Label、卫星图和坐标函数，交付可与原地形叠加的建筑及院落细节 OBJ。独立模块的看图规划和视觉验收依赖 **GPT-6 Astra（中等推理强度）**；Python/Blender 执行确定性计算和建模。
+
+早期方案曾尝试生成 **3DGS 语义地图**。这条路线现已废弃，不参与当前地图生成流程；`gen_semantic.py` 代码仍保留在仓库中，供追溯或单独实验，不应将其产物 `semanticMap.ply` 当作现行交付物。
 
 测试区域：河北三河鲍邱河附近农村区，约 0.47×0.47 km（117.0991°E, 39.8349°N 为中心），面积约 0.22 km²。
 
@@ -16,66 +18,62 @@
 
 ## 二、总体流程
 
-完整技术管线为：
+现行演示流程分为本仓库自动生成、独立建筑细节制作和 UE 整合三个环节：
 
-```
-分类 → 后处理 → AI 生成 3DGS 地图 → 转化为 OBJ → UE 制作语义层
-```
+1. `classify_vecw.py` 和 `label_postprocess.py` 从对齐的矢量图生成 10 倍语义标签。
+2. `gen_adaptive_terrain_centerline.py` 生成 Ground、Water、Building 地形 OBJ，并编排 `gen_water_flow.py` 生成水体中心线和速度场。这个一键入口的范围到此为止。
+3. 用户单独启动建筑细节模块，用上述同一轮地图产物制作、验收和打包建筑与院落细节。
+4. 在 UE 中叠加地形与建筑细节，使用水面、中心线及速度场呈现河流和扩散效果。UE 导入与表现不由本仓库的一键命令自动完成。
 
-当前阶段出于简化和输入数据不足（只有卫星图，缺乏三维信息）的原因，先制作**简化的 3DGS 语义地图**（`gen_semantic.py`），并新增**自适应分辨率地形 OBJ 生成**（`gen_adaptive_terrain_centerline.py` 的地形构建部分）与**水体流场生成**（`gen_water_flow.py`，主流中心线 + 分流速度场），直接供 UE 使用。
-
-> **管线变更说明**：`gen_semantic.py`（3DGS 语义地图）已从一键主管线中剔除，文件保留；需要时单独运行该脚本生成 `semanticMap.ply`（见 5.3）。一键管线目前只输出地形 OBJ 与水体流场两类产物。
-
-未来输入数据具备真实三维信息后，可用卫星图直出完整 3DGS 渲染点云，替换当前简化版语义地图。
+3DGS 语义地图方案已废弃；保留的 `gen_semantic.py` 仅供历史追溯或手动实验，不在现行流程中，也不是完成地图的前置条件。
 
 ## 三、系统架构
 
-```
-输入层（预处理，外部完成）
-  │
-  ├── 天地图卫星图 (satellite.tif)
-  ├── 天地图矢量图 (vec_raw.png)
-  └── 高程图 (dem.tif)
-  │
-  ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Stage 1: 语义分类                                            │
-│ classify_vecw.py :: VecClassifier + main()                   │
-│ 从 vec_raw.png 的 RGBA 颜色分类语义标签                       │
-│ 输出: water.tif, building.tif, road.tif, labels.tif         │
-└─────────────────────────────────────────────────────────────┘
-  │
-  ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Stage 2: 标签后处理                                          │
-│ label_postprocess.py :: LabelPostprocessor + main()          │
-│ 对 labels.tif 做 10x 上采样、轮廓平滑、边界提取              │
-│ 输出: labels_10x_no_boundary.tif, boundary_lines_10x.png    │
-└─────────────────────────────────────────────────────────────┘
-  │
-  ▼  Stage 3（两路并行，任一失败不影响其它，见 gen_adaptive_terrain_centerline.py）
-┌──────────────────────┬──────────────────────┐
-│ 3a: 自适应地形 OBJ    │ 3b: 水体流场           │
-│ gen_adaptive_terrain │ gen_water_flow.py     │
-│ _centerline.py       │ WaterFlowBuilder      │
-│ AdaptiveTerrainBuilder│ 10x 水体掩膜 + dem     │
-│ 10x标签+边界+dem      │ → 河网(主流+分流)      │
-│ → terrain_*.obj      │ → 中心线 CSV+速度场纹理 │
-└──────────────────────┴──────────────────────┘
-  │
-  ├── 坐标对齐校验：主流中心线 CSV 必须落在 terrain_water.obj 的 AABB 内
-  │   （常量与换算统一在 map_common.py，防止两模块坐标漂移）
-  ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Stage 4: UE 语义层（规划中）                                 │
-│ 材质系统、语义查询、区域过滤、交互编辑等上层应用             │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    I(["已对齐输入<br/>卫星图 · 矢量图 · DEM"])
+
+    subgraph BASE["① 地图基础 · 本仓库自动生成"]
+        direction TB
+        C["语义分类<br/>classify_vecw.py"] --> L["10 倍标签后处理<br/>label_postprocess.py"]
+        L --> T["自适应地形<br/>标签 + DEM → 地形 OBJ"]
+        L --> W["水体流场<br/>标签 + DEM → 中心线与速度场"]
+    end
+
+    D["② 建筑细节 · 独立模块<br/>地形 + 标签 + 卫星图 → 建筑与院落"]
+    U["③ UE 地图整合"]
+    V(["地形与建筑展示<br/>河流中心线 · 水体扩散"])
+    G["已废弃的 3DGS 实验<br/>gen_semantic.py 代码保留"]
+
+    I --> C
+    T --> D
+    T --> U
+    W --> U
+    D --> U
+    U --> V
+    C -.-> G
+
+    classDef input fill:#e9f2ff,stroke:#4580b8,color:#17324d;
+    classDef process fill:#e8f5ec,stroke:#4f9b65,color:#173d26;
+    classDef detail fill:#fff1d6,stroke:#c68b2d,color:#533709;
+    classDef output fill:#f0eaff,stroke:#8163ae,color:#38244f;
+    classDef legacy fill:#f4f4f4,stroke:#999,color:#666,stroke-dasharray: 4 4;
+    class I input;
+    class C,L,T,W process;
+    class D detail;
+    class U,V output;
+    class G legacy;
 ```
 
-> `gen_semantic.py`（3DGS 语义地图，SemanticMapBuilder）不在上图的编排管线内：
-> 文件保留、可独立运行生成 `semanticMap.ply`（见 5.3）。
+`map_common.py` 是地形、流场和建筑细节共用的坐标约定来源。OBJ 文件使用右手系、Z-up、厘米；中心线 CSV 直接用于 UE，Y 方向与文件侧 OBJ 的约定不同。建筑模块复制同一轮 `map_common.py` 并沿用原地形 OBJ 文件坐标，不额外翻转或重置原点。
 
-共享常量与坐标换算（`map_common.py`）：地形 OBJ 导出、中心线 CSV、速度场纹理都涉及「10x 像素 → UE 世界坐标」的换算，两处符号约定不同（OBJ 文件内为右手系 y=-north；UE 导入后 Y 翻转，CSV 直接以 UE 坐标 y=+south 读入）。此前 CSV Y 偏移正是因此产生，现统一由 `map_common.py` 提供常量与换算函数，并在地形/流场产物都就绪后做一次 AABB 对齐校验。
+### 实际效果预览
+
+以下三张为用户提供的 UE 截图，分别展示建筑、河流与中心线、扩散表现；它们是效果预览，不代替各模块的输入、几何和导入验收记录。
+
+| 建筑与院落 | 水体与中心线 | 水体扩散 |
+|:--:|:--:|:--:|
+| ![UE 建筑与院落预览](docs/images/ue_buildings.png) | ![UE 水体和中心线预览](docs/images/ue_water_centerline.png) | ![UE 水体扩散预览](docs/images/ue_diffusion.png) |
 
 ## 四、模块输入输出
 
@@ -83,10 +81,29 @@
 |------|----------|----------|----------|
 | **VecClassifier** | 语义分类器 | `vec_raw.png`, `satellite.tif` | `water.tif`, `building.tif`, `road.tif`, `labels.tif` |
 | **LabelPostprocessor** | 标签后处理器 | `labels.tif` | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `preview_classification_noboundary.png` |
-| **SemanticMapBuilder** | 3DGS 点云生成器（独立工具，不在主管线内） | `labels.tif`, `dem.tif` | `semanticMap.ply`（需单独运行 gen_semantic.py） |
+| **SemanticMapBuilder（历史实验）** | 已废弃的 3DGS 语义地图工具，代码保留 | `labels.tif`, `dem.tif` | `semanticMap.ply`（仅手动实验，不属于现行交付） |
 | **AdaptiveTerrainBuilder** | 自适应地形生成器 | `labels_10x_no_boundary.tif`, `boundary_lines_10x.png`, `dem.tif` | `terrain_ground.obj`, `terrain_water.obj`, `terrain_building.obj`（含各自 .mtl） |
+| **建筑细节独立模块** | 独立会话规划、建模和验收；不在一键管线内 | 同一轮 Building/Ground OBJ、10 倍 Label、卫星图、坐标函数、风格参考 | 一个含 BuildingDetails 与 CourtyardDetails 两对象的 OBJ，另附 MTL 和贴图 |
 | **WaterFlowBuilder** | 水体流场生成器 | `labels_10x_no_boundary.tif`（band1==0 水体掩膜）, `dem.tif` | 主流 `terrain_water_centerline.csv` + 河网/速度场预览 + `terrain_velocity_field.png` |
 | **map_common** | 共享常量/坐标换算 | — | 各模块共享的像素尺寸、缩放、UE 坐标换算函数 |
+
+### 建筑细节独立模块：地形之后、UE 导入之前
+
+建筑细节由同级目录的 [`SanHe_Building_Module_Standalone`](https://github.com/getyo/SanHe_Building_Module_Standalone) 承担，是可选的下游制作阶段。它不在本仓库的一键管线中，也不由 `gen_adaptive_terrain_centerline.py` 调用；用户另行开启 Codex 对话，按独立模块的 [完整执行管线](https://github.com/getyo/SanHe_Building_Module_Standalone/blob/main/docs/建筑细节完整执行管线_独立版.md) 运行。该模块负责结合卫星图和风格参考规划房屋、附房、厂房、院墙、院门、铺地与院内视觉小路，并生成、验证和渲染新增低模细节。执行会话按独立模块设计使用 **GPT-6 Astra（中等推理强度）**，负责风格判断、布局规划和逐图视觉验收。这里仅说明衔接关系；具体字段、阶段、命令及验收规则以独立模块文档和 `run_config.json` 为准。
+
+| 接口 | 独立模块目录中的默认路径 | 来源或作用 |
+|------|------------------------|------------|
+| 原建筑基础及材质 | `inputs/map/terrain_building.obj`、`inputs/map/terrain_building.mtl` | 本项目 `output/terrain_adaptive/` 中的原始 Building 产物副本；只用于贴地、坐标与验收，不进入细节 OBJ |
+| 地面上下文及材质 | `inputs/map/terrain_ground.obj`、`inputs/map/terrain_ground.mtl` | 同一轮的 Ground 产物副本；用于同场对齐参考 |
+| 建筑语义边界 | `inputs/map/labels_10x_no_boundary.tif` | 本项目 `TestInput/SanHe/Output_10x/` 的标签副本；Band 1 的 `40` 是新增建筑相关几何的硬边界 |
+| 布局与坐标 | `inputs/map/satellite.tif`、`inputs/map/map_common.py` | 同一轮卫星图与坐标函数的副本；前者用于布局判断，后者用于复用原 OBJ 坐标约定 |
+| 风格依据 | `inputs/style_references/`、`style_catalog/` | 按场景检查参考图和已批准参数；缺少适用风格依据时暂停并索取参考图 |
+| 可选高程核对 | `run_config.json` 指定的 DEM | 已有原建筑基础时可选，具体以独立模块配置为准 |
+| 正式交付 | `outputs/UE_Map/BuildingDetails.obj`、`outputs/UE_Map/BuildingDetails.mtl`、`outputs/UE_Map/textures/` | **一个 OBJ 内恰有** `BuildingDetails`（建筑）与 `CourtyardDetails`（院落）两个对象；另有导入说明和坐标报告 |
+
+复制输入时应保持同一轮地图的影像、标签、OBJ 和坐标函数对应，不能把旧任务清单或旧建筑基础当作新地图输入。独立模块先做输入与坐标审计，再创建本轮风格和全图任务；代表效果经用户确认后才生成全图，随后进行几何、Label 边界和固定及随机真实材质图验收。运行需要 Python、Blender（含 `bpy`），以及脚本使用的 `numpy`、`rasterio`、`affine`、`shapely`、`Pillow`；Blender 可执行文件由独立模块的 `run_config.json` 配置，当前默认值是机器相关的绝对路径。
+
+交付 OBJ 沿用原地形的右手系、Z-up、厘米文件坐标；导入 UE 时与原地形使用相同的导入和放置设置，不在文件侧额外翻转 Y、旋转或重置原点。原 `terrain_building.obj` 仍单独保留并与细节叠加；本模块不改写本项目的 Ground、Road、Water、水体流场或 UE 语义层。独立入口已有代表样本验证记录，但新独立版的全图 Stage 4–8 及最终 UE 导入尚需按该轮结果实际核对，不能把文档描述视为已完成交付。
 
 ## 五、使用说明
 
@@ -105,7 +122,7 @@ python gen_adaptive_terrain_centerline.py
    - `gen_water_flow` 水体河网 + 速度场（主流中心线 CSV + 分流衰减速度场）
 4. 坐标对齐校验：主流中心线 CSV 是否落在水面 OBJ 的 AABB 内
 
-> 3DGS 语义地图（`semanticMap.ply`）已不在本一键流程中；如需生成请单独运行 `python gen_semantic.py`（见 5.3）。
+> `gen_semantic.py` 属于已废弃的 3DGS 方案，代码仅保留供追溯或实验；现行地图生成不需要运行它。建筑细节也由独立模块手动启动，不属于这一键命令。
 
 ### 5.2 强制重新生成
 
@@ -130,7 +147,7 @@ python classify_vecw.py --vec TestInput/SanHe/vec_raw.png --sat TestInput/SanHe/
 # 标签后处理
 python label_postprocess.py --input TestInput/SanHe/labels.tif --out-dir TestInput/SanHe/Output_10x
 
-# 3DGS 语义地图
+# 已废弃的 3DGS 语义地图：仅供历史实验
 python gen_semantic.py --label TestInput/SanHe/labels.tif --dem TestInput/SanHe/dem.tif --out TestInput/SanHe/semanticMap.ply
 
 # 水体流场（河网 + 速度场）
@@ -205,7 +222,7 @@ python gen_water_flow.py --help
 |------|------|--------|
 | Band 1 (class_id) | 语义类别 | 0=水体, 20=道路, 40=建筑, 60=地面 |
 | Band 2 (road_level) | 道路等级 | 40=高速, 80=国道, 120=省道, 160=支路, 200=小路 |
-| Band 3 (height) | 相对高度（占位） | 120=建筑, 0=其他 |
+| Band 3 (height) | 历史占位标记，不代表真实建筑高度 | 120=建筑, 0=其他 |
 
 ### 6.2 LabelPostprocessor
 
@@ -213,7 +230,7 @@ python gen_water_flow.py --help
 
 ### 6.3 SemanticMapBuilder
 
-`gen_semantic.py` 中的类，从语义标签 + DEM 生成 3DGS PLY 点云。**已从主管线剔除**：文件保留，可作为独立工具单独运行生成 `semanticMap.ply`（见 5.3）。
+`gen_semantic.py` 中的历史实验类，从语义标签和 DEM 生成 3DGS PLY 点云。**该方案已废弃**；代码保留，可按 5.3 单独实验，但不参与现行地图流程或交付。
 
 ### 6.4 AdaptiveTerrainBuilder
 
@@ -272,7 +289,7 @@ python gen_water_flow.py --help
 - `TestInput/SanHe/building.tif` — 建筑二值掩膜
 - `TestInput/SanHe/road.tif` — 道路二值掩膜
 - `TestInput/SanHe/labels.tif` — 三通道语义标签
-- `TestInput/SanHe/semanticMap.ply` — 3DGS 语义点云（不在主管线内，需单独运行 gen_semantic.py 生成）
+- `TestInput/SanHe/semanticMap.ply` — 已废弃的 3DGS 方案的实验产物；仅手动运行 `gen_semantic.py` 时可能生成，不属于现行输出
 - `TestInput/SanHe/Output_10x/labels_10x_no_boundary.tif` — 10x 上采样语义标签
 - `TestInput/SanHe/Output_10x/boundary_lines_10x.png` — 独立轮廓线图
 - `TestInput/SanHe/Output_10x/preview_classification_noboundary.png` — 分类预览图
@@ -363,13 +380,4 @@ UE 端
 
 ## 十、待办
 
-- [ ] Stage 4：UE 语义层（材质系统、语义查询、区域过滤、交互编辑）
-- [x] 水体污染扩散 Grid2D 与 UE 材质联动（基础速度场纹理已接入；中心线 CSV Y 偏移已修复）
-- [x] 速度场重构：河网（主流+分流）分解，分流按 (1-d/L)^α 衰减，中心快、岸边慢
-- [x] 向心偏转（--velocity-converge）：流线轻微弯向中心线，可调强度
-- [x] 污染源注入系统（位置、颜色，与速度场解耦）
-- [x] 水体流场独立成模块（gen_water_flow.py），与地形 OBJ 并行生成
-- [x] gen_semantic.py（3DGS 语义地图）从主管线剔除：文件保留、可独立运行
-- [ ] 完整版 3DGS：从卫星图直出完整 3DGS 渲染点云（需补充三维信息输入）
-- [ ] labels.tif 第三通道补入真实建筑高度（GBA 或阴影法）
-- [ ] 多测试区域支持
+- [ ] 多区域地图支持：将目前在河北三河单一区域完成的流程推广到其他区域，并逐区域核对输入对齐、风格适配、坐标和 UE 展示。
